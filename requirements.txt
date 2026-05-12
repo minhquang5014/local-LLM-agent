@@ -1,0 +1,29 @@
+# Core LangChain / LangGraph
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-community>=0.3.0
+langchain-ollama>=0.2.0
+
+# Vector memory
+chromadb>=0.5.0
+
+# Local LLM (GGUF inference — for GGUF-converted models)
+# Install with Metal GPU support on Apple Silicon:
+#   CMAKE_ARGS="-DGGML_METAL=on" pip install llama-cpp-python
+llama-cpp-python>=0.3.0
+
+# HuggingFace transformers (for safetensors model — current model format)
+transformers>=4.45.0
+accelerate>=0.34.0
+torch>=2.4.0
+sentencepiece>=0.2.0
+protobuf>=4.25.0
+
+# Tools
+duckduckgo-search>=6.0.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# Utilities
+python-dotenv>=1.0.0
+rich>=13.0.0
