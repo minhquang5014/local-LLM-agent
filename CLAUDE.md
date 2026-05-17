@@ -19,6 +19,118 @@ Local ReAct agent running the Qwen3-9B model (safetensors format). Capabilities:
 
 ---
 
+## Full Agent Flow
+
+```mermaid
+flowchart TD
+    A([User types a message]) --> B
+
+    subgraph UI ["Browser UI  —  static/index.html"]
+        B[Send via SSE\nPOST /api/chat/stream]
+    end
+
+    B --> C
+
+    subgraph SERVER ["Web Server  —  server.py"]
+        C[FastAPI receives request\nattaches session history]
+    end
+
+    C --> D
+
+    subgraph AGENT ["ReAct Loop  —  src/agent.py  ·  max 10 iterations"]
+        D[Build Prompt] --> D1
+        D1[Inject chat history\nlast 6 turns] --> D2
+        D2[Auto memory recall\nChromaDB semantic search\ninjected as Relevant Memories] --> E
+
+        E[LLM Inference\nsrc/inference.py] --> E1
+
+        subgraph LLM ["LLM Backend  —  auto-selected"]
+            E1{Is Ollama running?}
+            E1 -->|Yes| E2[Ollama\nqwen2.5:7b]
+            E1 -->|No| E3{Apple Silicon?}
+            E3 -->|Yes| E4[mlx-lm\n~40 tok/s on M4]
+            E3 -->|No| E5[HuggingFace transformers\nCUDA / CPU]
+        end
+
+        E2 & E4 & E5 --> F
+
+        F[Parse LLM output] --> G{Output type?}
+
+        G -->|Thought + Action| H[Execute Tool]
+        G -->|Final Answer| DONE[Exit loop]
+
+        subgraph TOOLS ["Tools  —  src/tools.py"]
+            H --> H1{Which tool?}
+
+            H1 -->|web_search| WS
+            subgraph WS_BOX ["Web Search  —  auto-fallback chain"]
+                WS{SearXNG\nrunning?}
+                WS -->|Yes| WS1[SearXNG\nlocalhost:8080\nno rate limits]
+                WS -->|No| WS2{BRAVE_SEARCH\n_API_KEY set?}
+                WS2 -->|Yes| WS3[Brave Search API\n~1000 req/mo free]
+                WS2 -->|No| WS4[DuckDuckGo\nddgs · may rate-limit]
+            end
+
+            H1 -->|sfis_query| SF
+            subgraph SF_BOX ["SFIS  —  src/sfis.py"]
+                SF[Login to\nhttp://10.52.1.9] --> SF1[Query traveler\nfor serial number]
+                SF1 --> SF2[Extract structured fields\nPHASE · MODEL · CONFIG\nLINE · PANEL SN\nFAILED DATE · GROUP NAME\nFAILURE MESSAGE\nLIST OF FAILING TESTS]
+                SF2 --> SF3{Component\nrequested?}
+                SF3 -->|Yes| SF4[Vendor query\nVENDOR · LOT NO\nDATE CODE]
+                SF3 -->|No| SF5[Return\nstructured result]
+                SF4 --> SF5
+            end
+
+            H1 -->|memory_recall| MR
+            subgraph MEM_BOX ["Memory  —  src/memory.py · ChromaDB"]
+                MR[Semantic vector search\nrelevance threshold 0.30\nreturns top-5 with timestamps]
+                MS[Save fact\nnear-duplicate check 0.90\nadd Unix timestamp]
+            end
+
+            H1 -->|memory_store| MS
+            H1 -->|fetch_url| FU[HTTP GET\nBeautifulSoup extraction\nchunked for large pages]
+            H1 -->|read_file| FS[Read local file\nmax 1 MB]
+            H1 -->|list_dir| FS
+        end
+
+        WS1 & WS3 & WS4 --> OBS
+        SF5 --> OBS
+        MR & MS --> OBS
+        FU --> OBS
+        FS --> OBS
+
+        OBS[Observation added\nto history] --> ITER{Max iterations\nhit?}
+        ITER -->|No — loop back| D
+        ITER -->|Yes| FALLBACK[Return fallback\nmessage]
+    end
+
+    DONE --> SAV[Save Task+Answer\nto ChromaDB memory]
+    SAV --> STREAM
+    FALLBACK --> STREAM
+
+    subgraph OUT ["Output"]
+        STREAM[SSE stream events\nto browser\nthought · tool_call\ntool_result · answer]
+    end
+
+    STREAM --> END([User sees response])
+```
+
+### Event stream from agent to UI
+
+Each step in the loop emits an SSE event the browser renders in real time:
+
+| Event | When emitted | UI display |
+|-------|-------------|------------|
+| `start` | Loop begins | — |
+| `thought` | LLM produces a Thought | Italicised thought block |
+| `tool_call` | Tool about to run | Collapsible tool card with icon |
+| `tool_result` | Tool returned | Result inside the card |
+| `answer` | Final Answer produced | Markdown-rendered answer |
+| `error` | Exception thrown | Error message |
+| `done` | Loop finished | — |
+
+---
+
 ## Changes Made (2026-05-16)
 
 ### src/sfis.py — Structured field extraction
