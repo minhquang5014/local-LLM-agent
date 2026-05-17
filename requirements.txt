@@ -7,20 +7,24 @@ langchain-ollama>=0.2.0
 # Vector memory
 chromadb>=0.5.0
 
-# Local LLM (GGUF inference — for GGUF-converted models)
-# Install with Metal GPU support on Apple Silicon:
-#   CMAKE_ARGS="-DGGML_METAL=on" pip install llama-cpp-python
-llama-cpp-python>=0.3.0
+# Local LLM — Apple Silicon (primary backend)
+# Install mlx-lm for fast native inference:
+#   pip install mlx-lm
+mlx-lm>=0.19.0
 
-# HuggingFace transformers (for safetensors model — current model format)
+# Local LLM — HuggingFace transformers (fallback)
 transformers>=4.45.0
 accelerate>=0.34.0
 torch>=2.4.0
 sentencepiece>=0.2.0
 protobuf>=4.25.0
 
-# Tools
-duckduckgo-search>=6.0.0
+# Tools — web search
+# duckduckgo-search was renamed to ddgs in version 7.x
+# Install whichever is available; tools.py handles both imports:
+ddgs>=7.0.0
+
+# Tools — web scraping + HTTP
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 

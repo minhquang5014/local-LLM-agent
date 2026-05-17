@@ -48,7 +48,7 @@ TOOL_DESCRIPTIONS = "\n".join(
     f"- {t.name}: {t.description}" for t in ALL_TOOLS
 )
 
-SYSTEM_PROMPT = f"""You are a smart manufacturing AI assistant deployed on a Mac Mini M4.
+SYSTEM_PROMPT = f"""You are a smart manufacturing AI assistant running locally on Apple Silicon (mlx-lm).
 You help engineers query the internal SFIS manufacturing system, search the web for technical information, read local files, and reason through complex problems.
 
 ## Your capabilities
@@ -56,10 +56,12 @@ You help engineers query the internal SFIS manufacturing system, search the web 
 
 ## Key guidelines
 - SFIS is the internal manufacturing database at http://10.52.1.9. Use sfis_query to look up any serial number (SN).
-- When asked about an SN, always call sfis_query first. The tool returns all table data — Phase, Model, Config, SMT Line, Panel SN, failure history, vendor data, etc.
-- If the first sfis_query result doesn't have the detail needed, call it again with a component name appended (e.g. "SN123, R2251") to get vendor/lot/date-code data.
-- Always use the CONVERSATION HISTORY below to understand follow-up questions. If the user asks "what about more details" or "give me X", refer back to what you already retrieved.
+- sfis_query returns structured fields: Phase, Model, Config, SMT Line, Panel SN, SN position in panel, Failed Date, Lab In Time, Group Name, Failure Message, and List of Failing Tests.
+- If the first sfis_query result doesn't have vendor detail, call it again with a component location appended (e.g. "SN123, R2251") to get Vendor/Lot/Date-Code data.
+- Always check CONVERSATION HISTORY and RELEVANT MEMORIES (injected below) before searching the web or calling tools, to avoid repeating work.
 - When searching the web, today's date is automatically appended to queries.
+- Use memory_store to save concise facts you learn (e.g. "SN ABC123: Phase EVT2, failed FCT at burn_in station on 2024-05-10"). Keep stored facts short and specific.
+- Use memory_recall before starting a task to surface relevant prior findings.
 - Be concise and structured in your final answers. Use bullet points or tables for manufacturing data.
 
 ## Response format
@@ -88,10 +90,21 @@ def _build_prompt(state: AgentState, chat_history: list | None = None) -> str:
         lines.append("\n## Conversation History")
         for user_msg, assistant_msg in chat_history[-6:]:
             lines.append(f"User: {user_msg}")
-            # Truncate long assistant replies to avoid overflowing context
             short = assistant_msg[:600] + "…" if len(assistant_msg) > 600 else assistant_msg
             lines.append(f"Assistant: {short}")
         lines.append("")
+
+    # Auto-inject relevant memories on the first step (before any tool calls)
+    if not state["history"]:
+        try:
+            from src.memory import MemoryStore
+            memories = MemoryStore().search_text(state["task"], k=3)
+            if memories and "No relevant memories" not in memories:
+                lines.append("## Relevant Memories")
+                lines.append(memories)
+                lines.append("")
+        except Exception:
+            pass
 
     lines.append(f"## Current Task\n{state['task']}\n")
     for thought, action, observation in state["history"]:
@@ -251,6 +264,7 @@ TOOL_ICONS = {
     "list_dir": "📁",
     "memory_store": "💾",
     "memory_recall": "🧠",
+    "sfis_query": "🏭",
 }
 
 

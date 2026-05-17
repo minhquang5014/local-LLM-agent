@@ -1,0 +1,53 @@
+# SearXNG settings for local LLM agent
+# Full reference: https://docs.searxng.org/admin/settings/index.html
+
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "Local LLM Agent Search"
+
+search:
+  # Enable JSON format — required for the agent's API calls
+  formats:
+    - html
+    - json
+
+server:
+  # Bind to all interfaces so Docker port mapping works
+  bind_address: "0.0.0.0"
+  secret_key: "local-llm-agent-secret"
+  limiter: false        # disable rate limiting for local use
+  public_instance: false
+
+ui:
+  default_locale: "en"
+  default_theme: simple
+
+# Engines to enable — covers most general searches
+# Uncomment/add engines as needed
+engines:
+  - name: google
+    engine: google
+    shortcut: g
+
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: d
+
+  - name: bing
+    engine: bing
+    shortcut: b
+
+  - name: brave
+    engine: brave
+    shortcut: br
+
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: w
+    categories: general
+
+outgoing:
+  request_timeout: 10.0
+  useragent_suffix: ""

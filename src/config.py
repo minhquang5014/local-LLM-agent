@@ -22,6 +22,14 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 # Web search
 MAX_SEARCH_RESULTS = 5
 
+# Search backends — tried in order: SearXNG → Brave → DuckDuckGo
+# SearXNG: run locally via Docker (docker compose up -d) or point to any instance
+# Set to "" to skip SearXNG
+SEARXNG_BASE_URL = os.getenv("SEARXNG_BASE_URL", "http://localhost:8080")
+# Brave Search API: free tier ~1000 req/month — https://api-dashboard.search.brave.com
+# Set BRAVE_SEARCH_API_KEY in environment or .env file
+BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY", "")
+
 # Agent
 MAX_ITERATIONS = 10
 AGENT_VERBOSE = True

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -31,6 +32,13 @@ _LOGIN_HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     "X-Requested-With": "XMLHttpRequest",
 }
+
+# Station names that indicate functional/burn-in failures
+_FAILURE_STATIONS = [
+    "burn_in", "dfu", "fct", "cell", "wifi",
+    "s-cond", "s_cond", "t269", "t-269",
+    "a-cond", "a_cond",
+]
 
 
 class SFISAuthError(Exception):
@@ -94,10 +102,11 @@ def get_session() -> requests.Session:
 
 
 # ------------------------------------------------------------------
-# JSON / HTML table parsers (ported from original script)
+# HTML table parser (shared by both structured and generic paths)
 # ------------------------------------------------------------------
 
-def _parse_tables_from_json(json_obj: dict) -> dict:
+def _parse_tables_from_json(json_obj: dict) -> dict[str, list[dict]]:
+    """Parse SFIS JSON response into {table_title: [row_dict, ...]}."""
     raw_html = json_obj.get("tableContents", "")
     if not raw_html:
         return {}
@@ -134,14 +143,14 @@ def _parse_tables_from_json(json_obj: dict) -> dict:
 
             thead = tag.find("thead")
             tbody = tag.find("tbody")
-            headers = []
+            headers: list[str] = []
             if thead:
                 headers = [td.get_text(strip=True) for td in thead.find_all("td")]
             if not headers or not tbody:
                 result[unique_title] = []
                 continue
 
-            parsed = []
+            parsed: list[dict] = []
             rows = tbody.find_all("tr")
             if rows:
                 for tr in rows:
@@ -163,56 +172,141 @@ def _convert_ec_multiline(ec_string: str) -> str:
 
 
 # ------------------------------------------------------------------
-# Traveler query — returns ALL table data as formatted text
+# Structured traveler extraction (mirrors test/get_fa_data_on_sfis 6.py)
 # ------------------------------------------------------------------
 
-def _query_traveler(session: requests.Session, sn: str) -> str:
-    url = (
-        f"{SFIS_BASE}/SFIS/Production/Travelers/Trav_1/resources/getQueryJSON.jsp"
-        f"?ColItem=serial_number&Field_Kind=ALLFIELD"
-        f"&fdSerial_Number=Y&fdModel_Serial=Y&fdMo_Number=Y&fdLine_Name=Y"
-        f"&fdSection_Name=Y&fdGroup_Name=Y&fdStation_Name=Y"
-        f"&fdIn_Station_Time=Y&fdOut_Station_Time=Y&fdRETEST_SEQ=Y"
-        f"&fdEmp_No=Y&fdQa_NO=Y&fdQa_Result=Y&fdPallet_No=Y&fdCarton_NO=Y"
-        f"&fdPO_NO=Y&fdCONTAINER_NO=Y&fdSHIPPING_SN=Y&fdMAC=Y&fdTRACK_NO=Y"
-        f"&fdKEY_PART_NO=Y&fdMODEL_NAME=Y&fdBill_NO=Y&fdError_flag=Y"
-        f"&fdFinish_flag=Y&fdVersion_Code=Y&fdSpecial_route=Y&fdCust_model=Y"
-        f"&fdCust_PN=Y&fdInv_no=Y&fdOther_MaC=Y&fdKP_NO_C=Y&fdMain_Product=Y"
-        f"&fdProduct_Name=Y&fdBox_No=Y&fdLOTN=Y&fdLOTB=Y&fdOut_Line_Time=Y"
-        f"&fdDRYBOX=Y&fdVIRTUAL_LINE1=Y&fdVIRTUAL_LINE2=Y&fdPanelSeq=Y"
-        f"&fdBCadd=Y&fdBCqry=Y&InpData={sn}&FromURL=N"
-    )
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-        "X-Requested-With": "XMLHttpRequest",
+def _extract_structured_fields(tables: dict[str, list[dict]]) -> dict[str, str]:
+    """
+    Pull the specific fields engineers care about from the parsed tables.
+    Returns a flat dict of named fields.
+    """
+    fields: dict[str, str] = {
+        "PHASE": "", "MODEL": "", "CONFIG": "",
+        "LINE": "", "PANEL SN": "", "SN SEQ IN PANEL": "",
+        "FAILED DATE": "", "LAB IN TIME": "",
+        "GROUP NAME": "", "FAILURE MESSAGE": "",
+        "LIST OF FAILING TESTS": "",
     }
-    r = session.get(url, headers=headers, timeout=15)
+
+    # Phase / Model / Config  ← "Work Order / Model Data"
+    model_table = tables.get("Work Order / Model Data", [])
+    for row in model_table:
+        if row.get("HW BOM"):
+            fields["PHASE"] = row.get("VERSION CODE", "")
+            fields["MODEL"] = row.get("HW BOM", "")
+            fields["CONFIG"] = row.get("SW BOM", "")
+            break
+
+    # SMT Line / Panel SN  ← "SN Detail Data"
+    sn_detail = tables.get("SN Detail Data", [])
+    for row in sn_detail:
+        if row.get("VIRTUAL LINE1"):
+            fields["LINE"] = row.get("VIRTUAL LINE1", "")
+            fields["PANEL SN"] = row.get("TRACK NO", "")
+            break
+
+    # SN position in panel  ← "Wip Tracking Data"
+    wip_table = tables.get("Wip Tracking Data", [])
+    for row in wip_table:
+        seq = row.get("SN SEQ IN PANEL", "")
+        if seq:
+            fields["SN SEQ IN PANEL"] = seq
+            break
+
+    # Failure date / group / test codes  ← "SN Repair Data"
+    repair_table = tables.get("SN Repair Data", [])
+    for row in repair_table:
+        station = (row.get("TEST STATION") or "").lower()
+        if any(s in station for s in _FAILURE_STATIONS):
+            test_code = row.get("TEST CODE", "")
+            if test_code:
+                fields["FAILED DATE"] = row.get("TEST TIME", "")
+                fields["GROUP NAME"] = row.get("TEST GROUP", "")
+                fields["LIST OF FAILING TESTS"] = test_code
+                break
+
+    # Lab-in time  ← "Laboratory In/Out"
+    lab_table = tables.get("Laboratory In/Out", [])
+    for row in lab_table:
+        if row.get("LAB IN EMP") and row.get("LAB IN TIME"):
+            fields["LAB IN TIME"] = row.get("LAB IN TIME", "")
+            break
+
+    # Failure message + refined test list  ← "Bobcat Data"
+    bobcat_table = tables.get("Bobcat Data", [])
+    failed_date = fields.get("FAILED DATE", "")
+    if bobcat_table and failed_date:
+        try:
+            dt = datetime.strptime(failed_date, "%Y/%m/%d %H:%M:%S")
+            target_time = dt.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            target_time = ""
+
+        for row in bobcat_table:
+            station_id = row.get("STATION ID", "")
+            stop_time = row.get("STOP TIME", "")
+            failing_tests = row.get("LIST OF FAILING TESTS", "")
+            if failing_tests and "FAAP" in station_id and stop_time == target_time:
+                fields["FAILURE MESSAGE"] = row.get("FAILURE MESSAGE", "")
+                fields["LIST OF FAILING TESTS"] = _convert_ec_multiline(failing_tests)
+                break
+
+    # Fallback: if LIST OF FAILING TESTS still has semicolons, expand them
+    lot = fields["LIST OF FAILING TESTS"]
+    if ";" in lot:
+        fields["LIST OF FAILING TESTS"] = _convert_ec_multiline(lot)
+
+    return fields
+
+
+# ------------------------------------------------------------------
+# Traveler query
+# ------------------------------------------------------------------
+
+_TRAVELER_URL = (
+    f"{SFIS_BASE}/SFIS/Production/Travelers/Trav_1/resources/getQueryJSON.jsp"
+    "?ColItem=serial_number&Field_Kind=ALLFIELD"
+    "&fdSerial_Number=Y&fdModel_Serial=Y&fdMo_Number=Y&fdLine_Name=Y"
+    "&fdSection_Name=Y&fdGroup_Name=Y&fdStation_Name=Y"
+    "&fdIn_Station_Time=Y&fdOut_Station_Time=Y&fdRETEST_SEQ=Y"
+    "&fdEmp_No=Y&fdQa_NO=Y&fdQa_Result=Y&fdPallet_No=Y&fdCarton_NO=Y"
+    "&fdPO_NO=Y&fdCONTAINER_NO=Y&fdSHIPPING_SN=Y&fdMAC=Y&fdTRACK_NO=Y"
+    "&fdKEY_PART_NO=Y&fdMODEL_NAME=Y&fdBill_NO=Y&fdError_flag=Y"
+    "&fdFinish_flag=Y&fdVersion_Code=Y&fdSpecial_route=Y&fdCust_model=Y"
+    "&fdCust_PN=Y&fdInv_no=Y&fdOther_MaC=Y&fdKP_NO_C=Y&fdMain_Product=Y"
+    "&fdProduct_Name=Y&fdBox_No=Y&fdLOTN=Y&fdLOTB=Y&fdOut_Line_Time=Y"
+    "&fdDRYBOX=Y&fdVIRTUAL_LINE1=Y&fdVIRTUAL_LINE2=Y&fdPanelSeq=Y"
+    "&fdBCadd=Y&fdBCqry=Y&InpData={sn}&FromURL=N"
+)
+
+_TRAVELER_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+
+def _query_traveler(session: requests.Session, sn: str) -> tuple[dict[str, str], dict[str, list[dict]]]:
+    """
+    Fetch and parse the traveler for *sn*.
+    Returns (structured_fields, all_tables) — callers can use either.
+    """
+    url = _TRAVELER_URL.format(sn=sn)
+    try:
+        r = session.get(url, headers=_TRAVELER_HEADERS, timeout=15)
+    except requests.Timeout:
+        raise RuntimeError("SFIS traveler query timed out.")
+
     if "application/json" not in r.headers.get("Content-Type", ""):
-        return ""
+        return {}, {}
 
-    tables = _parse_tables_from_json(r.json())
-    if not tables:
-        return ""
+    try:
+        tables = _parse_tables_from_json(r.json())
+    except Exception as e:
+        logger.warning("Failed to parse SFIS JSON: %s", e)
+        return {}, {}
 
-    lines: list[str] = []
-    for table_name, rows in tables.items():
-        if not rows:
-            continue
-        lines.append(f"\n[{table_name}]")
-        for row in rows:
-            for key, val in row.items():
-                if val:
-                    # Expand multi-value EC strings onto separate lines
-                    if ";" in str(val):
-                        lines.append(f"  {key}:")
-                        for part in _convert_ec_multiline(val).splitlines():
-                            lines.append(f"    {part}")
-                    else:
-                        lines.append(f"  {key}: {val}")
-            lines.append("")
-
-    return "\n".join(lines)
+    return _extract_structured_fields(tables), tables
 
 
 # ------------------------------------------------------------------
@@ -225,6 +319,7 @@ def _query_vendor(session: requests.Session, sn: str, location: str) -> dict:
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Referer": url,
         "X-Requested-With": "XMLHttpRequest",
     }
     payload = {
@@ -232,8 +327,13 @@ def _query_vendor(session: requests.Session, sn: str, location: str) -> dict:
         "buildevent": "", "modelname": "", "family": "", "sn": sn, "config": "",
         "comppn": "", "location": location, "mo": "", "carton_no": "",
     }
-    r = session.post(url, data=payload, headers=headers, timeout=15)
+    try:
+        r = session.post(url, data=payload, headers=headers, timeout=15)
+    except requests.Timeout:
+        return {}
+
     if "application/json" not in r.headers.get("Content-Type", ""):
+        logger.warning("SFIS vendor response is HTML — session may have expired.")
         return {}
     data = r.json()
     if not data.get("data"):
@@ -254,12 +354,12 @@ def _query_vendor(session: requests.Session, sn: str, location: str) -> dict:
 def query_sn(serial_number: str, component: Optional[str] = None) -> str:
     """
     Query SFIS for a serial number and return a formatted summary string.
-    Optionally include a component location for vendor data.
+    Optionally include a component location (e.g. 'R2251') for vendor data.
     """
     session = get_session()
     try:
-        traveler_text = _query_traveler(session, serial_number)
-        if not traveler_text.strip():
+        structured, _ = _query_traveler(session, serial_number)
+        if not structured:
             return f"No data found in SFIS for serial number: {serial_number}"
 
         vendor: dict = {}
@@ -268,7 +368,18 @@ def query_sn(serial_number: str, component: Optional[str] = None) -> str:
     finally:
         session.close()
 
-    lines = [f"SFIS Data for SN: {serial_number}", "=" * 40, traveler_text]
+    lines = [f"SFIS Data for SN: {serial_number}", "=" * 40]
+
+    # Ordered structured fields
+    field_order = [
+        "PHASE", "MODEL", "CONFIG", "LINE", "PANEL SN", "SN SEQ IN PANEL",
+        "FAILED DATE", "LAB IN TIME", "GROUP NAME",
+        "FAILURE MESSAGE", "LIST OF FAILING TESTS",
+    ]
+    for key in field_order:
+        val = structured.get(key, "")
+        if val:
+            lines.append(f"{key:<24}: {val}")
 
     if vendor:
         lines.append("\nComponent Vendor Data")

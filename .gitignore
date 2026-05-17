@@ -2,4 +2,9 @@ model/
 QwenPaw-main/
 sfis_cred.json
 venv/
-CLAUDE.md
+sample_folder/
+
+# SearXNG runtime files (limiter DB, uwsgi socket, cache)
+searxng/limiter.toml
+searxng/uwsgi.ini
+searxng/*.db
