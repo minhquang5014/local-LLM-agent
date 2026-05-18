@@ -8,46 +8,199 @@ Available tools:
   - list_dir        — List files in a directory
   - memory_store    — Save a fact to vector memory
   - memory_recall   — Retrieve relevant memories
+  - sfis_query      — Query the internal SFIS manufacturing system
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 from langchain_core.tools import Tool
 
 logger = logging.getLogger(__name__)
 
+
 # ------------------------------------------------------------------
-# Web search
+# DDGS import — support both duckduckgo-search 6.x and ddgs 7.x+
 # ------------------------------------------------------------------
 
+def _get_ddgs_class():
+    try:
+        from duckduckgo_search import DDGS
+        return DDGS
+    except ImportError:
+        pass
+    try:
+        from ddgs import DDGS
+        return DDGS
+    except ImportError:
+        return None
+
+
+# ------------------------------------------------------------------
+# Web search — SearXNG (primary) with DuckDuckGo fallback
+# ------------------------------------------------------------------
+
+_MAX_RETRIES = 3
+_RETRY_BACKOFF = [1.0, 2.0, 4.0]
+
+
+def _format_results(results: list[dict], source: str) -> str:
+    """Format a list of {title, url, snippet} dicts into a labelled string."""
+    lines = [f"[Search via {source}]"]
+    for r in results:
+        lines.append(
+            f"Title: {r['title']}\n"
+            f"URL: {r['url']}\n"
+            f"Snippet: {r['snippet']}"
+        )
+    return "\n---\n".join(lines)
+
+
+def _searxng_search(query: str, max_results: int) -> list[dict] | None:
+    """
+    Query the local SearXNG instance.
+    Returns a list of result dicts, or None if SearXNG is unavailable.
+    """
+    import requests
+    from src.config import SEARXNG_BASE_URL
+
+    if not SEARXNG_BASE_URL:
+        return None
+
+    try:
+        resp = requests.get(
+            f"{SEARXNG_BASE_URL}/search",
+            params={"q": query, "format": "json", "language": "en"},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.debug("SearXNG unavailable: %s", e)
+        return None
+
+    results = []
+    for r in data.get("results", [])[:max_results]:
+        results.append({
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "snippet": r.get("content", ""),
+        })
+    return results if results else None
+
+
+def _brave_search(query: str, max_results: int) -> list[dict] | None:
+    """
+    Query Brave Search API (free tier ~1000 req/month).
+    Returns a list of result dicts, or None if API key is not set or request fails.
+    Get a free key at: https://api-dashboard.search.brave.com
+    """
+    import requests
+    from src.config import BRAVE_SEARCH_API_KEY
+
+    if not BRAVE_SEARCH_API_KEY:
+        return None
+
+    try:
+        resp = requests.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            params={"q": query, "count": max_results, "search_lang": "en"},
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+                "X-Subscription-Token": BRAVE_SEARCH_API_KEY,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.warning("Brave Search failed: %s", e)
+        return None
+
+    results = []
+    for r in data.get("web", {}).get("results", [])[:max_results]:
+        results.append({
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "snippet": r.get("description", ""),
+        })
+    return results if results else None
+
+
+def _ddg_search(query: str, max_results: int) -> list[dict] | None:
+    """
+    Query DuckDuckGo with retries.
+    Returns a list of result dicts, or None if unavailable/failed.
+    """
+    DDGS = _get_ddgs_class()
+    if DDGS is None:
+        return None
+
+    last_error: Exception | None = None
+    for attempt, backoff in enumerate((_RETRY_BACKOFF + [0])[:_MAX_RETRIES]):
+        try:
+            with DDGS() as ddgs:
+                raw = list(ddgs.text(query, max_results=max_results))
+            results = [
+                {
+                    "title": r.get("title", ""),
+                    "url": r.get("href", ""),
+                    "snippet": r.get("body", ""),
+                }
+                for r in raw
+            ]
+            return results if results else None
+        except Exception as e:
+            last_error = e
+            logger.warning("DDG search attempt %d failed: %s", attempt + 1, e)
+            if attempt < _MAX_RETRIES - 1:
+                time.sleep(backoff)
+
+    logger.error("DDG search failed after %d attempts: %s", _MAX_RETRIES, last_error)
+    return None
+
+
 def _web_search(query: str) -> str:
-    from ddgs import DDGS
     from src.config import MAX_SEARCH_RESULTS
     from datetime import date
+
     today = date.today().strftime("%B %d %Y")
     dated_query = f"{query} {today}"
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(dated_query, max_results=MAX_SEARCH_RESULTS))
-        if not results:
-            return "No results found."
-        lines = []
-        for r in results:
-            lines.append(f"Title: {r.get('title', '')}\nURL: {r.get('href', '')}\nSnippet: {r.get('body', '')}\n")
-        return "\n---\n".join(lines)
-    except Exception as e:
-        return f"Search error: {e}"
+
+    # 1. SearXNG — fully local, no rate limits (requires Docker or native install)
+    results = _searxng_search(dated_query, MAX_SEARCH_RESULTS)
+    if results is not None:
+        return _format_results(results, "SearXNG")
+
+    # 2. Brave Search — reliable API, free tier ~1000 req/month (set BRAVE_SEARCH_API_KEY)
+    results = _brave_search(dated_query, MAX_SEARCH_RESULTS)
+    if results is not None:
+        return _format_results(results, "Brave Search")
+
+    # 3. DuckDuckGo — free but can be rate-limited
+    results = _ddg_search(dated_query, MAX_SEARCH_RESULTS)
+    if results is not None:
+        return _format_results(results, "DuckDuckGo")
+
+    return (
+        "Web search unavailable. Options to fix:\n"
+        "  1. SearXNG: docker compose up -d  (or run natively)\n"
+        "  2. Brave Search: set BRAVE_SEARCH_API_KEY env var (free at api-dashboard.search.brave.com)\n"
+        "  3. DuckDuckGo: pip install ddgs  (may be rate-limited)"
+    )
 
 
 web_search_tool = Tool(
     name="web_search",
     func=_web_search,
     description=(
-        "Search the web using DuckDuckGo. Today's date is automatically appended "
-        "to every query so results are always current. "
+        "Search the web. Auto-selects the best available backend: "
+        "SearXNG (local, no rate limits) → Brave Search API → DuckDuckGo. "
+        "Today's date is automatically appended so results are current. "
         "Input: a search query string. "
         "Output: titles, URLs, and snippets of the top results."
     ),
@@ -57,24 +210,19 @@ web_search_tool = Tool(
 # Fetch URL  (with smart extraction + chunked summarisation)
 # ------------------------------------------------------------------
 
-# Max chars fed to the LLM per chunk. Fits comfortably in Qwen3.5 context.
 _CHUNK_SIZE = 6_000
-# Hard cap on total chars scraped (prevents runaway pages)
 _MAX_SCRAPE = 60_000
 
 
 def _extract_text(html: str) -> str:
-    """Return clean text from HTML, preferring main-content tags."""
     from bs4 import BeautifulSoup
+    import re
 
     soup = BeautifulSoup(html, "html.parser")
-
-    # Remove noise tags
     for tag in soup(["script", "style", "nav", "footer", "header",
                      "aside", "form", "button", "noscript", "iframe"]):
         tag.decompose()
 
-    # Try to isolate the main content block
     main = (
         soup.find("main") or
         soup.find("article") or
@@ -98,8 +246,6 @@ def _extract_text(html: str) -> str:
                 lines.append(t)
 
     text = "\n".join(lines)
-    # Collapse excessive blank lines
-    import re
     text = re.sub(r'\n{3,}', '\n\n', text).strip()
     return text
 
@@ -107,14 +253,14 @@ def _extract_text(html: str) -> str:
 def _fetch_url(url: str) -> str:
     import requests
 
-    # Support bare IPs / internal addresses (add http:// if missing scheme)
     if not url.startswith(("http://", "https://")):
         url = "http://" + url
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/124.0 Safari/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
         "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
         "Accept-Language": "en-US,en;q=0.9",
     }
@@ -126,27 +272,21 @@ def _fetch_url(url: str) -> str:
         return f"Fetch error: {e}"
 
     content_type = resp.headers.get("Content-Type", "")
-
-    # Plain text / JSON — return directly
     if "json" in content_type:
         return resp.text[:_MAX_SCRAPE]
     if "text/plain" in content_type:
         return resp.text[:_MAX_SCRAPE]
 
     text = _extract_text(resp.text)
-
     if not text.strip():
         return "Page fetched but no readable text found (may require JavaScript or login)."
 
     total = len(text)
-
-    # Short page — return as-is
     if total <= _CHUNK_SIZE:
         return f"[Scraped {total} chars from {url}]\n\n{text}"
 
-    # Long page — return first chunk + summary prompt hint
     chunks = [text[i:i+_CHUNK_SIZE] for i in range(0, min(total, _MAX_SCRAPE), _CHUNK_SIZE)]
-    header = f"[Scraped {total} chars from {url} — split into {len(chunks)} chunks. Showing all chunks.]\n\n"
+    header = f"[Scraped {total} chars from {url} — {len(chunks)} chunks]\n\n"
     return header + "\n\n---CHUNK BREAK---\n\n".join(chunks)
 
 
@@ -157,7 +297,6 @@ fetch_url_tool = Tool(
         "Scrape and extract text from any URL — works for public websites AND "
         "internal network addresses (e.g. http://10.52.1.9). "
         "Automatically strips menus/ads and focuses on main content. "
-        "Handles large pages by returning all content in chunks. "
         "Input: a URL or bare IP address (scheme optional). "
         "Output: clean extracted text ready for summarisation."
     ),
@@ -222,6 +361,7 @@ list_dir_tool = Tool(
 
 _memory_store_instance = None
 
+
 def _get_memory():
     global _memory_store_instance
     if _memory_store_instance is None:
@@ -232,8 +372,8 @@ def _get_memory():
 
 def _memory_save(text: str) -> str:
     mem = _get_memory()
-    doc_id = mem.add(text, source="agent")
-    return f"Saved to memory (id={doc_id})."
+    result = mem.add(text, source="agent")
+    return result  # already returns a message string
 
 
 def _memory_recall(query: str) -> str:
@@ -247,7 +387,7 @@ memory_store_tool = Tool(
     description=(
         "Save important information to persistent vector memory. "
         "Input: the text or fact to remember. "
-        "Output: confirmation with memory ID."
+        "Output: confirmation (or note if a similar memory already exists)."
     ),
 )
 
@@ -257,7 +397,7 @@ memory_recall_tool = Tool(
     description=(
         "Search persistent memory for relevant past information. "
         "Input: a query describing what you want to recall. "
-        "Output: the most relevant stored memories."
+        "Output: the most relevant stored memories (only those above relevance threshold)."
     ),
 )
 
@@ -287,10 +427,11 @@ sfis_query_tool = Tool(
     func=_sfis_query,
     description=(
         "Query the internal SFIS manufacturing system (http://10.52.1.9) for a serial number. "
-        "Automatically checks server connectivity, authenticates, and validates the SN — "
+        "Automatically checks connectivity, authenticates, and validates the SN — "
         "returns a clear message if the server is unreachable, login fails, or the SN is not found. "
-        "Returns traveler data: phase, model, config, SMT line, panel SN, failure history, "
-        "group name, failure message, and failing tests. "
+        "Returns structured fields: Phase, Model, Config, SMT Line, Panel SN, "
+        "SN position in panel, Failed Date, Lab In Time, Group Name, "
+        "Failure Message, and List of Failing Tests. "
         "Input format: 'SERIAL_NUMBER'  or  'SERIAL_NUMBER, COMPONENT_LOCATION' "
         "(add a component location like 'R2251' or 'U7000' to also get vendor/lot/date-code data). "
         "Credentials must be saved in sfis_cred.json in the project root."
