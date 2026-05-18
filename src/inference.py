@@ -15,12 +15,20 @@ Usage:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Iterator, List, Optional
 
 from langchain_core.language_models.llms import LLM
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
 
 logger = logging.getLogger(__name__)
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove Qwen3 <think>...</think> blocks from raw model output."""
+    return _THINK_RE.sub("", text).strip()
 
 
 # ------------------------------------------------------------------
@@ -75,7 +83,9 @@ class MlxLM(LLM):
             logits_processors=logits_processors,
             verbose=False,
         )
-        # Qwen3.5 thinking mode appends a reasoning trace after "---". Strip it.
+        # Strip Qwen3 <think>...</think> blocks before any further processing.
+        raw = _strip_thinking(raw)
+        # Fallback: also cut at the old "---" separator some versions used.
         raw = raw.split("\n---\n")[0].strip()
         # Honour stop sequences — mlx-lm may not support them natively, so we
         # post-process here.  This is the primary defence against the model

@@ -53,10 +53,14 @@ class SFISAuthError(Exception):
 
 def check_connectivity() -> bool:
     """Return True if the SFIS server (10.52.1.9) is reachable."""
+    print(f"[SFIS] Checking connectivity to {SFIS_BASE} ...")
     try:
         r = requests.get(SFIS_BASE, timeout=5, allow_redirects=True)
-        return r.status_code < 500
-    except Exception:
+        reachable = r.status_code < 500
+        print(f"[SFIS] Server {'reachable' if reachable else 'returned error'} (HTTP {r.status_code})")
+        return reachable
+    except Exception as e:
+        print(f"[SFIS] ERROR — server not reachable: {e}")
         return False
 
 
@@ -86,6 +90,7 @@ def save_credentials(username: str, password: str) -> None:
 # ------------------------------------------------------------------
 
 def _login(session: requests.Session, username: str, password: str) -> bool:
+    print(f"[SFIS] Authenticating as '{username}' ...")
     try:
         r = session.post(
             LOGIN_URL,
@@ -94,8 +99,11 @@ def _login(session: requests.Session, username: str, password: str) -> bool:
             timeout=10,
         )
         r.raise_for_status()
-        return r.json().get("RES") == "OK"
+        ok = r.json().get("RES") == "OK"
+        print(f"[SFIS] Login {'SUCCESS' if ok else 'FAILED — wrong credentials?'}")
+        return ok
     except Exception as e:
+        print(f"[SFIS] ERROR — login request failed: {e}")
         logger.warning("SFIS login attempt failed: %s", e)
         return False
 
@@ -104,6 +112,7 @@ def get_session() -> requests.Session:
     """Return an authenticated SFIS session, or raise SFISAuthError."""
     username, password = load_credentials()
     if not username or not password:
+        print(f"[SFIS] ERROR — no credentials found in {CRED_FILE}")
         raise SFISAuthError(
             "No SFIS credentials found. "
             f"Create '{CRED_FILE}' with {{\"username\": \"...\", \"password\": \"...\"}} "
@@ -307,21 +316,30 @@ def _query_traveler(session: requests.Session, sn: str) -> tuple[dict[str, str],
     Returns (structured_fields, all_tables) — callers can use either.
     """
     url = _TRAVELER_URL.format(sn=sn)
+    print(f"[SFIS] Querying traveler for SN: {sn}")
     try:
         r = session.get(url, headers=_TRAVELER_HEADERS, timeout=15)
+        print(f"[SFIS] Traveler response: HTTP {r.status_code}, Content-Type: {r.headers.get('Content-Type', 'unknown')}")
     except requests.Timeout:
+        print(f"[SFIS] ERROR — traveler query timed out for SN: {sn}")
         raise RuntimeError("SFIS traveler query timed out.")
 
     if "application/json" not in r.headers.get("Content-Type", ""):
+        print(f"[SFIS] ERROR — expected JSON but got: {r.headers.get('Content-Type')} (session may have expired)")
         return {}, {}
 
     try:
         tables = _parse_tables_from_json(r.json())
+        print(f"[SFIS] Parsed {len(tables)} table(s): {list(tables.keys())}")
     except Exception as e:
+        print(f"[SFIS] ERROR — failed to parse JSON response: {e}")
         logger.warning("Failed to parse SFIS JSON: %s", e)
         return {}, {}
 
-    return _extract_structured_fields(tables), tables
+    structured = _extract_structured_fields(tables)
+    filled = {k: v for k, v in structured.items() if v}
+    print(f"[SFIS] Extracted fields: {list(filled.keys()) if filled else 'none — SN not found'}")
+    return structured, tables
 
 
 # ------------------------------------------------------------------
@@ -330,6 +348,7 @@ def _query_traveler(session: requests.Session, sn: str) -> tuple[dict[str, str],
 
 def _query_vendor(session: requests.Session, sn: str, location: str) -> dict:
     url = f"{SFIS_BASE}/SFIS/PVS-vs-SFIS/SN/resources/getQuery.jsp"
+    print(f"[SFIS] Querying vendor data for SN: {sn}, location: {location}")
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -344,22 +363,28 @@ def _query_vendor(session: requests.Session, sn: str, location: str) -> dict:
     }
     try:
         r = session.post(url, data=payload, headers=headers, timeout=15)
+        print(f"[SFIS] Vendor response: HTTP {r.status_code}")
     except requests.Timeout:
+        print(f"[SFIS] ERROR — vendor query timed out for SN: {sn}, location: {location}")
         return {}
 
     if "application/json" not in r.headers.get("Content-Type", ""):
+        print(f"[SFIS] ERROR — vendor response is HTML (session may have expired)")
         logger.warning("SFIS vendor response is HTML — session may have expired.")
         return {}
     data = r.json()
     if not data.get("data"):
+        print(f"[SFIS] Vendor query: no records found")
         return {}
     item = data["data"][0]
-    return {
+    result = {
         "VENDOR": item.get("VENDOR", ""),
         "LOT NO": item.get("LOT_NO", ""),
         "DATE CODE": item.get("DATE_CODE", ""),
         "COMPONENT SN": item.get("COMPONENT_SN", ""),
     }
+    print(f"[SFIS] Vendor data: {result}")
+    return result
 
 
 # ------------------------------------------------------------------
@@ -372,6 +397,7 @@ def query_sn(serial_number: str, component: Optional[str] = None) -> str:
     Automatically checks connectivity, authenticates, and validates the SN.
     Optionally include a component location (e.g. 'R2251') for vendor data.
     """
+    print(f"\n[SFIS] ── query_sn: SN={serial_number}, component={component} ──")
     if not check_connectivity():
         return "SFIS server is not reachable (http://10.52.1.9). Check network connectivity."
 
@@ -379,6 +405,7 @@ def query_sn(serial_number: str, component: Optional[str] = None) -> str:
     try:
         structured, _ = _query_traveler(session, serial_number)
         if not structured:
+            print(f"[SFIS] SN '{serial_number}' not found — returning invalid SN message")
             return (
                 f"Serial number '{serial_number}' was not found in SFIS. "
                 "It may be invalid or not yet recorded in the system."
@@ -389,6 +416,7 @@ def query_sn(serial_number: str, component: Optional[str] = None) -> str:
             vendor = _query_vendor(session, serial_number, component)
     finally:
         session.close()
+        print(f"[SFIS] Session closed")
 
     lines = [f"SFIS Data for SN: {serial_number}", "=" * 40]
 
@@ -431,6 +459,7 @@ def query_2a_defects(
     retest_sequence: str = "FIRST",
 ) -> str:
     """Query 2A defect data for a date range. Returns formatted table output."""
+    print(f"\n[SFIS] ── query_2a_defects: {from_date} → {to_date}, model='{model_name}', group='{group_name}' ──")
     if not check_connectivity():
         return "SFIS server is not reachable (http://10.52.1.9). Check network connectivity."
 
@@ -457,13 +486,18 @@ def query_2a_defects(
             "Accept": "application/json",
             "X-Requested-With": "XMLHttpRequest",
         }
+        print(f"[SFIS] Sending 2A request to {_2A_URL}")
         r = session.get(_2A_URL, params=params, headers=headers, timeout=20)
+        print(f"[SFIS] 2A response: HTTP {r.status_code}, Content-Type: {r.headers.get('Content-Type', 'unknown')}")
         if "application/json" not in r.headers.get("Content-Type", ""):
+            print(f"[SFIS] ERROR — 2A query returned non-JSON")
             return "2A query returned a non-JSON response."
 
         tables = _parse_tables_from_json(r.json())
         if not tables:
+            print(f"[SFIS] 2A query: no records found")
             return f"No 2A defect data found for {from_date} → {to_date}."
+        print(f"[SFIS] 2A query: {sum(len(r) for r in tables.values())} rows across {len(tables)} table(s)")
 
         lines: list[str] = [f"2A Defects  {from_date} → {to_date}", "=" * 50]
         for table_name, rows in tables.items():
@@ -501,6 +535,7 @@ def query_pvs(
     comp_pn: str = "",
 ) -> str:
     """Query PVS-vs-SFIS for vendor, lot, date-code, and component traceability."""
+    print(f"\n[SFIS] ── query_pvs: sn='{sn}', location='{location}', model='{model_name}' ──")
     if not check_connectivity():
         return "SFIS server is not reachable (http://10.52.1.9). Check network connectivity."
 
@@ -527,14 +562,19 @@ def query_pvs(
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "X-Requested-With": "XMLHttpRequest",
         }
+        print(f"[SFIS] Sending PVS request to {_PVS_URL}")
         r = session.post(_PVS_URL, data=payload, headers=headers, timeout=15)
+        print(f"[SFIS] PVS response: HTTP {r.status_code}, Content-Type: {r.headers.get('Content-Type', 'unknown')}")
         if "application/json" not in r.headers.get("Content-Type", ""):
+            print(f"[SFIS] ERROR — PVS query returned non-JSON")
             return "PVS query returned a non-JSON response."
 
         data = r.json()
         records = data.get("data", [])
         if not records:
+            print(f"[SFIS] PVS query: no records found")
             return "No PVS data found for the given parameters."
+        print(f"[SFIS] PVS query: {len(records)} record(s) found")
 
         lines: list[str] = ["PVS-vs-SFIS Results", "=" * 40]
         for item in records:

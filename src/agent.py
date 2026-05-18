@@ -48,26 +48,41 @@ TOOL_DESCRIPTIONS = "\n".join(
     f"- {t.name}: {t.description}" for t in ALL_TOOLS
 )
 
-SYSTEM_PROMPT = f"""You are a smart manufacturing AI assistant running locally on Apple Silicon (mlx-lm).
-You help engineers query the internal SFIS manufacturing system, search the web for technical information, read local files, and reason through complex problems.
+SYSTEM_PROMPT = f"""You are a smart manufacturing AI assistant.
+You help engineers query the SFIS manufacturing system, search the web, and read files.
 
-## Your capabilities
+## Tools
 {TOOL_DESCRIPTIONS}
 
-## Key guidelines
-- SFIS is the internal manufacturing database at http://10.52.1.9. Use sfis_query to look up any serial number (SN).
-- sfis_query returns structured fields: Phase, Model, Config, SMT Line, Panel SN, SN position in panel, Failed Date, Lab In Time, Group Name, Failure Message, and List of Failing Tests.
-- If the first sfis_query result doesn't have vendor detail, call it again with a component location appended (e.g. "SN123, R2251") to get Vendor/Lot/Date-Code data.
-- Always check CONVERSATION HISTORY and RELEVANT MEMORIES (injected below) before searching the web or calling tools, to avoid repeating work.
-- When searching the web, today's date is automatically appended to queries.
-- Use memory_store to save concise facts you learn (e.g. "SN ABC123: Phase EVT2, failed FCT at burn_in station on 2024-05-10"). Keep stored facts short and specific.
-- Use memory_recall before starting a task to surface relevant prior findings.
-- Be concise and structured in your final answers. Use bullet points or tables for manufacturing data.
+## SFIS queries — strict workflow
+When the user provides a serial number (SN) or asks about SFIS data:
+
+STEP 1 — call sfis_query immediately. This is MANDATORY. Never skip it.
+  - sfis_query checks connectivity → authenticates → queries the SN, all in one call.
+  - Credentials are pre-loaded from sfis_cred.json. Never ask the user. Never store to memory.
+  - Do NOT output a Final Answer before calling sfis_query at least once.
+  - Do NOT use data from previous conversations — SFIS data must always be fetched live.
+
+STEP 2 — report the tool result as your Final Answer, exactly as follows:
+  - "Server not reachable" in result → Final Answer: SFIS server is down. Check network connectivity to 10.52.1.9.
+  - "Login failed" in result        → Final Answer: SFIS login failed. Check credentials in sfis_cred.json.
+  - "not found in SFIS" in result   → Final Answer: Serial number X was not found. It may be invalid.
+  - Any other result                → Final Answer: present the data clearly in a table or bullet list.
+
+Do NOT call memory_recall or memory_store for SFIS queries.
+
+## Missing information
+If the user's request is unclear or missing required info (e.g. no SN provided), output a Final Answer asking the user for the specific information you need. Do NOT loop or call tools repeatedly.
+
+## Web search / other tasks
+- Use web_search or fetch_url for general questions.
+- Use memory_recall / memory_store only after completing the main task, to save useful findings.
+- Today's date is automatically appended to web search queries.
 
 ## Response format
 Thought: <your reasoning>
 Action: <tool_name>
-Action Input: <input>
+Action Input: <input to the tool — must not be empty>
 
 OR when done:
 
@@ -78,7 +93,9 @@ Rules:
 - Always start with Thought.
 - One tool per step.
 - Never repeat the same Action + Input.
+- Never call a tool with an empty Action Input.
 - Always output "Final Answer:" when done.
+- When in doubt, output a Final Answer asking the user for clarification.
 """
 
 
@@ -94,18 +111,6 @@ def _build_prompt(state: AgentState, chat_history: list | None = None) -> str:
             lines.append(f"Assistant: {short}")
         lines.append("")
 
-    # Auto-inject relevant memories on the first step (before any tool calls)
-    if not state["history"]:
-        try:
-            from src.memory import MemoryStore
-            memories = MemoryStore().search_text(state["task"], k=3)
-            if memories and "No relevant memories" not in memories:
-                lines.append("## Relevant Memories")
-                lines.append(memories)
-                lines.append("")
-        except Exception:
-            pass
-
     lines.append(f"## Current Task\n{state['task']}\n")
     for thought, action, observation in state["history"]:
         lines.append(f"Thought: {thought}")
@@ -119,6 +124,8 @@ def _build_prompt(state: AgentState, chat_history: list | None = None) -> str:
 
 def _parse_llm_output(raw: str) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
     """Parse LLM output into (thought, action, action_input, final_answer)."""
+    # Strip Qwen3 <think>...</think> blocks (safety net — also done in inference.py).
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
     raw = raw.strip()
     if raw.startswith("Thought:"):
         raw = raw[len("Thought:"):].strip()
@@ -133,7 +140,13 @@ def _parse_llm_output(raw: str) -> Tuple[str, Optional[str], Optional[str], Opti
     final_match = re.search(r"Final Answer:\s*(.*)", raw, re.DOTALL)
     if final_match:
         thought_part = raw[: final_match.start()].strip()
-        return thought_part, None, None, final_match.group(1).strip()
+        answer = final_match.group(1).strip()
+        # Cut off any trailing reasoning the model appended after the answer
+        for cutoff in ("\nThought:", "\nAction:", "\nWait,", "\nActually,", "\nHowever,", "\nBut "):
+            idx = answer.find(cutoff)
+            if idx != -1:
+                answer = answer[:idx].strip()
+        return thought_part, None, None, answer
 
     action_match = re.search(r"Action:\s*(\w+)", raw)
     input_match = re.search(r"Action Input:\s*(.*?)(?=\nThought:|\nAction:|\Z)", raw, re.DOTALL)
@@ -189,8 +202,13 @@ def act_node(state: AgentState) -> AgentState:
     tool_map = {t.name: t for t in ALL_TOOLS}
     tool = tool_map.get(action)
 
+    # Tools that legitimately accept empty input
+    _EMPTY_INPUT_OK = {"list_dir", "memory_recall"}
+
     if tool is None:
         observation = f"Unknown tool '{action}'. Available: {list(tool_map.keys())}"
+    elif not action_input and action not in _EMPTY_INPUT_OK:
+        observation = f"Error: empty Action Input for '{action}'. Provide a non-empty input or output a Final Answer."
     else:
         try:
             observation = tool.run(action_input)
