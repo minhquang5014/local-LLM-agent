@@ -251,6 +251,9 @@ TOOL_ICONS = {
     "list_dir": "📁",
     "memory_store": "💾",
     "memory_recall": "🧠",
+    "sfis_query": "🏭",
+    "sfis_2a_defects": "📊",
+    "sfis_pvs_query": "🔩",
 }
 
 

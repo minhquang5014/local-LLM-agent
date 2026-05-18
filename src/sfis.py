@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 SFIS_BASE = "http://10.52.1.9"
 LOGIN_URL = f"{SFIS_BASE}/SFIS/Member/resources/func_login.jsp"
+_2A_URL = f"{SFIS_BASE}/SFIS/Yield/Manager_2A/resources/getQueryJSON.jsp"
+_PVS_URL = f"{SFIS_BASE}/SFIS/PVS-vs-SFIS/SN/resources/getQuery.jsp"
 CRED_FILE = Path(__file__).resolve().parent.parent / "sfis_cred.json"
 
 _LOGIN_HEADERS = {
@@ -35,6 +37,19 @@ _LOGIN_HEADERS = {
 
 class SFISAuthError(Exception):
     pass
+
+
+# ------------------------------------------------------------------
+# Connectivity check
+# ------------------------------------------------------------------
+
+def check_connectivity() -> bool:
+    """Return True if the SFIS server (10.52.1.9) is reachable."""
+    try:
+        r = requests.get(SFIS_BASE, timeout=5, allow_redirects=True)
+        return r.status_code < 500
+    except Exception:
+        return False
 
 
 # ------------------------------------------------------------------
@@ -254,13 +269,20 @@ def _query_vendor(session: requests.Session, sn: str, location: str) -> dict:
 def query_sn(serial_number: str, component: Optional[str] = None) -> str:
     """
     Query SFIS for a serial number and return a formatted summary string.
+    Automatically checks connectivity, authenticates, and validates the SN.
     Optionally include a component location for vendor data.
     """
+    if not check_connectivity():
+        return "SFIS server is not reachable (http://10.52.1.9). Check network connectivity."
+
     session = get_session()
     try:
         traveler_text = _query_traveler(session, serial_number)
         if not traveler_text.strip():
-            return f"No data found in SFIS for serial number: {serial_number}"
+            return (
+                f"Serial number '{serial_number}' was not found in SFIS. "
+                "It may be invalid or not yet recorded in the system."
+            )
 
         vendor: dict = {}
         if component:
@@ -278,3 +300,142 @@ def query_sn(serial_number: str, component: Optional[str] = None) -> str:
                 lines.append(f"{key:<24}: {val}")
 
     return "\n".join(lines)
+
+
+# ------------------------------------------------------------------
+# 2A defect query (time period)
+# ------------------------------------------------------------------
+
+def query_2a_defects(
+    from_date: str,
+    to_date: str,
+    *,
+    profit_center: str = "0000000025",
+    mo: str = "ALL",
+    model_serial: str = "",
+    model_name: str = "",
+    line_name: str = "",
+    group_name: str = "ALL",
+    error_code: str = "",
+    retest_sequence: str = "FIRST",
+) -> str:
+    """Query 2A defect data for a date range. Returns formatted table output."""
+    if not check_connectivity():
+        return "SFIS server is not reachable (http://10.52.1.9). Check network connectivity."
+
+    session = get_session()
+    try:
+        params = {
+            "profitCenter": profit_center,
+            "projectVersion": "ALL",
+            "fromDate": from_date,
+            "toDate": to_date,
+            "BU": "", "Customer": "", "buildEvent": "", "family": "",
+            "buildConfig": "", "MO": mo, "modelSerial": model_serial,
+            "modelName": model_name, "lotNo": "", "bigLot": "",
+            "testStation": "ALL", "lineName": line_name,
+            "groupName": group_name, "errorCode": error_code,
+            "majorProject": "", "projectName": "", "productName": "",
+            "retestSequence": retest_sequence, "recordType": "ALL",
+            "empNo": "ALL", "processType": "ALL",
+            "cbxGroupName": "Yes", "cbxTestTime": "Yes", "cbxErrorCode": "Yes",
+            "group_name": group_name, "mo_number": mo,
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        r = session.get(_2A_URL, params=params, headers=headers, timeout=20)
+        if "application/json" not in r.headers.get("Content-Type", ""):
+            return "2A query returned a non-JSON response."
+
+        tables = _parse_tables_from_json(r.json())
+        if not tables:
+            return f"No 2A defect data found for {from_date} → {to_date}."
+
+        lines: list[str] = [f"2A Defects  {from_date} → {to_date}", "=" * 50]
+        for table_name, rows in tables.items():
+            if not rows:
+                continue
+            lines.append(f"\n[{table_name}]")
+            for row in rows:
+                for key, val in row.items():
+                    if val:
+                        if ";" in str(val):
+                            lines.append(f"  {key}:")
+                            for part in _convert_ec_multiline(val).splitlines():
+                                lines.append(f"    {part}")
+                        else:
+                            lines.append(f"  {key}: {val}")
+                lines.append("")
+        return "\n".join(lines)
+    finally:
+        session.close()
+
+
+# ------------------------------------------------------------------
+# PVS-vs-SFIS query (flexible component/vendor lookup)
+# ------------------------------------------------------------------
+
+def query_pvs(
+    sn: str = "",
+    location: str = "",
+    model_name: str = "",
+    family: str = "",
+    from_date: str = "",
+    to_date: str = "",
+    mo: str = "",
+    carton_no: str = "",
+    comp_pn: str = "",
+) -> str:
+    """Query PVS-vs-SFIS for vendor, lot, date-code, and component traceability."""
+    if not check_connectivity():
+        return "SFIS server is not reachable (http://10.52.1.9). Check network connectivity."
+
+    session = get_session()
+    try:
+        payload = {
+            "projectver": "",
+            "disable_period": "on" if not (from_date or to_date) else "",
+            "fromDate": from_date,
+            "toDate": to_date,
+            "buildevent": "",
+            "modelname": model_name,
+            "family": family,
+            "sn": sn,
+            "config": "",
+            "comppn": comp_pn,
+            "location": location,
+            "mo": mo,
+            "carton_no": carton_no,
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        r = session.post(_PVS_URL, data=payload, headers=headers, timeout=15)
+        if "application/json" not in r.headers.get("Content-Type", ""):
+            return "PVS query returned a non-JSON response."
+
+        data = r.json()
+        records = data.get("data", [])
+        if not records:
+            return "No PVS data found for the given parameters."
+
+        lines: list[str] = ["PVS-vs-SFIS Results", "=" * 40]
+        for item in records:
+            for field, label in [
+                ("SN", "SN"), ("MODEL_NAME", "Model Name"), ("VENDOR", "Vendor"),
+                ("LOT_NO", "Lot No"), ("DATE_CODE", "Date Code"),
+                ("COMPONENT_SN", "Component SN"), ("LOCATION", "Location"),
+            ]:
+                val = item.get(field, "")
+                if val:
+                    lines.append(f"  {label:<16}: {val}")
+            lines.append("")
+        return "\n".join(lines)
+    finally:
+        session.close()
