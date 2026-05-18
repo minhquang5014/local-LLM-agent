@@ -404,7 +404,7 @@ def query_sn(serial_number: str, component: Optional[str] = None) -> str:
     session = get_session()
     try:
         structured, _ = _query_traveler(session, serial_number)
-        if not structured:
+        if not any(structured.values()):
             print(f"[SFIS] SN '{serial_number}' not found — returning invalid SN message")
             return (
                 f"Serial number '{serial_number}' was not found in SFIS. "

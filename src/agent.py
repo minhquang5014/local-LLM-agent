@@ -38,6 +38,9 @@ class AgentState(TypedDict):
     history: Annotated[List[Tuple[str, str, str]], operator.add]
     final_answer: Optional[str]
     iterations: int
+    chat_history: Optional[list]
+    _pending_action: Optional[str]
+    _pending_input: Optional[str]
 
 
 # ------------------------------------------------------------------
@@ -101,6 +104,16 @@ Rules:
 
 def _build_prompt(state: AgentState, chat_history: list | None = None) -> str:
     lines = [SYSTEM_PROMPT]
+
+    # Auto memory recall on the first step — inject relevant past context
+    if not state["history"]:
+        try:
+            from src.memory import MemoryStore
+            memories = MemoryStore().search_text(state["task"], k=3)
+            if memories and "No relevant memories" not in memories:
+                lines.append(f"\n## Relevant Memories\n{memories}\n")
+        except Exception:
+            pass
 
     # Inject recent conversation so the model can answer follow-ups
     if chat_history:
@@ -169,7 +182,7 @@ def think_node(state: AgentState) -> AgentState:
     if state["iterations"] >= MAX_ITERATIONS:
         return {**state, "final_answer": "Reached maximum iterations without a final answer."}
 
-    prompt = _build_prompt(state)
+    prompt = _build_prompt(state, state.get("chat_history"))
     llm = get_llm()
     raw = llm.invoke(prompt, stop=["\nObservation:"])
 
@@ -314,11 +327,14 @@ def stream_agent(task: str, chat_history: list | None = None):
 
         if final_answer:
             yield {"type": "answer", "content": final_answer}
-            try:
-                from src.memory import MemoryStore
-                MemoryStore().add(f"Task: {task}\nAnswer: {final_answer}", source="agent_result")
-            except Exception:
-                pass
+            _sfis_tools = {"sfis_query", "sfis_2a_defects", "sfis_pvs_query"}
+            used_sfis = any(act.split("|")[0] in _sfis_tools for _, act, _ in history)
+            if not used_sfis:
+                try:
+                    from src.memory import MemoryStore
+                    MemoryStore().add(f"Task: {task}\nAnswer: {final_answer}", source="agent_result")
+                except Exception:
+                    pass
             break
 
         if action:
@@ -348,7 +364,7 @@ def stream_agent(task: str, chat_history: list | None = None):
     yield {"type": "done"}
 
 
-def run_agent(task: str) -> str:
+def run_agent(task: str, chat_history: list | None = None) -> str:
     """Run the reasoning agent on a task and return the final answer."""
     agent = get_agent()
     initial_state: AgentState = {
@@ -356,16 +372,21 @@ def run_agent(task: str) -> str:
         "history": [],
         "final_answer": None,
         "iterations": 0,
+        "chat_history": chat_history,
+        "_pending_action": None,
+        "_pending_input": None,
     }
     result = agent.invoke(initial_state)
     answer = result.get("final_answer") or "Agent did not produce a final answer."
 
-    # Persist the answer to memory for future runs
-    try:
-        from src.memory import MemoryStore
-        mem = MemoryStore()
-        mem.add(f"Task: {task}\nAnswer: {answer}", source="agent_result")
-    except Exception:
-        pass
+    # Persist to memory — skip SFIS results (must always be fetched live)
+    _sfis_tools = {"sfis_query", "sfis_2a_defects", "sfis_pvs_query"}
+    used_sfis = any(act.split("|")[0] in _sfis_tools for _, act, _ in result.get("history", []))
+    if not used_sfis:
+        try:
+            from src.memory import MemoryStore
+            MemoryStore().add(f"Task: {task}\nAnswer: {answer}", source="agent_result")
+        except Exception:
+            pass
 
     return answer
