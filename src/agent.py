@@ -22,6 +22,9 @@ import re
 from typing import TypedDict, List, Tuple, Optional, Annotated
 import operator
 
+# Matches serial-number-like tokens: 8+ uppercase alphanumeric chars
+_SN_RE = re.compile(r'\b([A-Z0-9]{8,})\b')
+
 from langgraph.graph import StateGraph, END
 
 from src.config import MAX_ITERATIONS, AGENT_VERBOSE
@@ -301,6 +304,36 @@ TOOL_ICONS = {
 }
 
 
+def _sfis_guard(task: str, final_answer: Optional[str], history: list, tool_map: dict):
+    """
+    If the model produced a Final Answer without ever calling sfis_query,
+    and the task looks like an SFIS/SN query, force the tool call first.
+    Returns (sn, result) to inject, or (None, None) to do nothing.
+    """
+    if not final_answer:
+        return None, None
+    already_called = any("sfis_query" in act for _, act, _ in history)
+    if already_called:
+        return None, None
+    task_up = task.upper()
+    is_sfis = (
+        bool(_SN_RE.search(task))
+        or "SERIAL" in task_up
+        or " SN " in task_up
+        or "SFIS" in task_up
+        or task_up.startswith("SN")
+    )
+    if not is_sfis:
+        return None, None
+    m = _SN_RE.search(task)
+    sn = m.group(1) if m else ""
+    if not sn:
+        return None, None
+    print(f"[AGENT] WARNING: model skipped sfis_query — forcing tool call for SN={sn}")
+    result = tool_map["sfis_query"].run(sn)
+    return sn, result
+
+
 def stream_agent(task: str, chat_history: list | None = None):
     """Generator yielding UI events as the agent works. Used by the web server."""
     from src.inference import get_llm
@@ -320,10 +353,20 @@ def stream_agent(task: str, chat_history: list | None = None):
         }
         prompt = _build_prompt(state, chat_history)
         raw = llm.invoke(prompt, stop=["\nObservation:"])
+        print(f"[AGENT iter={i}] raw output:\n{raw}\n---")
         thought, action, action_input, final_answer = _parse_llm_output(raw)
 
         if thought:
             yield {"type": "thought", "content": thought}
+
+        # Hard guard: if model skipped sfis_query for an SN query, force it now
+        forced_sn, forced_result = _sfis_guard(task, final_answer, history, tool_map)
+        if forced_sn:
+            yield {"type": "tool_call", "name": "sfis_query", "icon": TOOL_ICONS.get("sfis_query", "🏭"), "input": forced_sn}
+            yield {"type": "tool_result", "name": "sfis_query", "output": forced_result[:2000]}
+            history.append(("Forced SFIS lookup before answering.", f"sfis_query|{forced_sn}", forced_result))
+            final_answer = None
+            continue
 
         if final_answer:
             yield {"type": "answer", "content": final_answer}
