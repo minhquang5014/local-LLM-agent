@@ -212,33 +212,56 @@ def _extract_structured_fields(tables: dict[str, list[dict]]) -> dict[str, str]:
         "LIST OF FAILING TESTS": "",
     }
 
+    print(f"[SFIS] _extract_structured_fields: tables available: {list(tables.keys())}")
+
     # Phase / Model / Config  ← "Work Order / Model Data"
     model_table = tables.get("Work Order / Model Data", [])
+    if not model_table:
+        print(f"[SFIS]   Work Order / Model Data: NOT FOUND")
     for row in model_table:
         if row.get("HW BOM"):
             fields["PHASE"] = row.get("VERSION CODE", "")
             fields["MODEL"] = row.get("HW BOM", "")
             fields["CONFIG"] = row.get("SW BOM", "")
+            print(f"[SFIS]   PHASE={fields['PHASE']!r}  MODEL={fields['MODEL']!r}  CONFIG={fields['CONFIG']!r}")
             break
+    else:
+        if model_table:
+            print(f"[SFIS]   Work Order / Model Data: no row with HW BOM — first row: {model_table[0]}")
 
     # SMT Line / Panel SN  ← "SN Detail Data"
     sn_detail = tables.get("SN Detail Data", [])
+    if not sn_detail:
+        print(f"[SFIS]   SN Detail Data: NOT FOUND")
     for row in sn_detail:
         if row.get("VIRTUAL LINE1"):
             fields["LINE"] = row.get("VIRTUAL LINE1", "")
             fields["PANEL SN"] = row.get("TRACK NO", "")
+            print(f"[SFIS]   LINE={fields['LINE']!r}  PANEL SN={fields['PANEL SN']!r}")
             break
+    else:
+        if sn_detail:
+            print(f"[SFIS]   SN Detail Data: no row with VIRTUAL LINE1 — first row: {sn_detail[0]}")
 
     # SN position in panel  ← "Wip Tracking Data"
     wip_table = tables.get("Wip Tracking Data", [])
+    if not wip_table:
+        print(f"[SFIS]   Wip Tracking Data: NOT FOUND")
     for row in wip_table:
         seq = row.get("SN SEQ IN PANEL", "")
         if seq:
             fields["SN SEQ IN PANEL"] = seq
+            print(f"[SFIS]   SN SEQ IN PANEL={fields['SN SEQ IN PANEL']!r}")
             break
+    else:
+        if wip_table:
+            print(f"[SFIS]   Wip Tracking Data: SN SEQ IN PANEL empty — first row: {wip_table[0]}")
 
     # Failure date / group / test codes  ← "SN Repair Data"
     repair_table = tables.get("SN Repair Data", [])
+    if not repair_table:
+        print(f"[SFIS]   SN Repair Data: NOT FOUND")
+    _repair_matched = False
     for row in repair_table:
         station = (row.get("TEST STATION") or "").lower()
         if any(s in station for s in _FAILURE_STATIONS):
@@ -247,25 +270,41 @@ def _extract_structured_fields(tables: dict[str, list[dict]]) -> dict[str, str]:
                 fields["FAILED DATE"] = row.get("TEST TIME", "")
                 fields["GROUP NAME"] = row.get("TEST GROUP", "")
                 fields["LIST OF FAILING TESTS"] = test_code
+                print(f"[SFIS]   SN Repair match station={station!r}  FAILED DATE={fields['FAILED DATE']!r}  GROUP={fields['GROUP NAME']!r}")
+                _repair_matched = True
                 break
+    if repair_table and not _repair_matched:
+        stations_seen = [row.get("TEST STATION", "") for row in repair_table]
+        print(f"[SFIS]   SN Repair Data: no matching failure station — stations in table: {stations_seen}")
 
     # Lab-in time  ← "Laboratory In/Out"
     lab_table = tables.get("Laboratory In/Out", [])
+    if not lab_table:
+        print(f"[SFIS]   Laboratory In/Out: NOT FOUND")
     for row in lab_table:
         if row.get("LAB IN EMP") and row.get("LAB IN TIME"):
             fields["LAB IN TIME"] = row.get("LAB IN TIME", "")
+            print(f"[SFIS]   LAB IN TIME={fields['LAB IN TIME']!r}")
             break
+    else:
+        if lab_table:
+            print(f"[SFIS]   Laboratory In/Out: no row with LAB IN EMP+TIME — first row: {lab_table[0]}")
 
     # Failure message + refined test list  ← "Bobcat Data"
     bobcat_table = tables.get("Bobcat Data", [])
     failed_date = fields.get("FAILED DATE", "")
-    if bobcat_table and failed_date:
+    if not bobcat_table:
+        print(f"[SFIS]   Bobcat Data: NOT FOUND")
+    elif not failed_date:
+        print(f"[SFIS]   Bobcat Data: skipped (no FAILED DATE to match against)")
+    else:
         try:
             dt = datetime.strptime(failed_date, "%Y/%m/%d %H:%M:%S")
             target_time = dt.strftime("%Y-%m-%d %H:%M:%S")
         except ValueError:
             target_time = ""
-
+        print(f"[SFIS]   Bobcat Data: looking for FAAP station with STOP TIME={target_time!r}")
+        _bobcat_matched = False
         for row in bobcat_table:
             station_id = row.get("STATION ID", "")
             stop_time = row.get("STOP TIME", "")
@@ -273,13 +312,19 @@ def _extract_structured_fields(tables: dict[str, list[dict]]) -> dict[str, str]:
             if failing_tests and "FAAP" in station_id and stop_time == target_time:
                 fields["FAILURE MESSAGE"] = row.get("FAILURE MESSAGE", "")
                 fields["LIST OF FAILING TESTS"] = _convert_ec_multiline(failing_tests)
+                print(f"[SFIS]   Bobcat match: station={station_id!r}  FAILURE MESSAGE={fields['FAILURE MESSAGE']!r}")
+                _bobcat_matched = True
                 break
+        if not _bobcat_matched:
+            faap_rows = [(r.get("STATION ID", ""), r.get("STOP TIME", "")) for r in bobcat_table if "FAAP" in (r.get("STATION ID") or "")]
+            print(f"[SFIS]   Bobcat Data: no FAAP match — FAAP rows (station, stop_time): {faap_rows}")
 
     # Fallback: if LIST OF FAILING TESTS still has semicolons, expand them
     lot = fields["LIST OF FAILING TESTS"]
     if ";" in lot:
         fields["LIST OF FAILING TESTS"] = _convert_ec_multiline(lot)
 
+    print(f"[SFIS] Extracted fields result: {fields}")
     return fields
 
 
@@ -317,6 +362,7 @@ def _query_traveler(session: requests.Session, sn: str) -> tuple[dict[str, str],
     """
     url = _TRAVELER_URL.format(sn=sn)
     print(f"[SFIS] Querying traveler for SN: {sn}")
+    print(f"[SFIS] Full URL: {url}")
     try:
         r = session.get(url, headers=_TRAVELER_HEADERS, timeout=15)
         print(f"[SFIS] Traveler response: HTTP {r.status_code}, Content-Type: {r.headers.get('Content-Type', 'unknown')}")
@@ -329,8 +375,14 @@ def _query_traveler(session: requests.Session, sn: str) -> tuple[dict[str, str],
         return {}, {}
 
     try:
-        tables = _parse_tables_from_json(r.json())
-        print(f"[SFIS] Parsed {len(tables)} table(s): {list(tables.keys())}")
+        json_obj = r.json()
+        raw_html = json_obj.get("tableContents", "")
+        print(f"[SFIS] tableContents length: {len(raw_html)} chars")
+        tables = _parse_tables_from_json(json_obj)
+        print(f"[SFIS] Parsed {len(tables)} table(s):")
+        for tname, rows in tables.items():
+            cols = list(rows[0].keys()) if rows else []
+            print(f"[SFIS]   '{tname}': {len(rows)} row(s) | cols: {cols}")
     except Exception as e:
         print(f"[SFIS] ERROR — failed to parse JSON response: {e}")
         logger.warning("Failed to parse SFIS JSON: %s", e)
@@ -438,7 +490,9 @@ def query_sn(serial_number: str, component: Optional[str] = None) -> str:
             if val:
                 lines.append(f"{key:<24}: {val}")
 
-    return "\n".join(lines)
+    output = "\n".join(lines)
+    print(f"[SFIS] Returning to agent:\n{output}")
+    return output
 
 
 # ------------------------------------------------------------------
