@@ -415,11 +415,24 @@ def _sfis_query(inp: str) -> str:
     sn = parts[0]
     component = parts[1] if len(parts) > 1 else None
     try:
-        return query_sn(sn, component)
+        result = query_sn(sn, component)
     except SFISAuthError as e:
         return f"SFIS auth error: {e}"
     except Exception as e:
         return f"SFIS query error: {e}"
+
+    # Auto-cache full SFIS data to memory so follow-up questions don't need a re-query.
+    # The 0.90 near-duplicate threshold in MemoryStore prevents duplicate entries for
+    # the same SN queried twice.
+    if "SFIS Data for SN" in result:
+        try:
+            from src.memory import MemoryStore
+            MemoryStore().add(result, source="sfis_cache")
+            print(f"[SFIS] Cached SN={sn} data to memory ({len(result)} chars)")
+        except Exception as e:
+            print(f"[SFIS] Warning: could not save to memory: {e}")
+
+    return result
 
 
 sfis_query_tool = Tool(

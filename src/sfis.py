@@ -195,6 +195,31 @@ def _convert_ec_multiline(ec_string: str) -> str:
     return "\n".join(ec.strip() for ec in ec_string.split(";") if ec.strip())
 
 
+def _format_full_tables(tables: dict) -> str:
+    """
+    Serialize all parsed SFIS tables into a compact human-readable block.
+    Each row is a single line of KEY=VALUE | KEY=VALUE pairs.
+    Empty tables are skipped. Cell values are capped at 120 chars.
+    """
+    if not tables:
+        return ""
+    lines = ["\n── Full SFIS Tables ──"]
+    for table_name, rows in tables.items():
+        if not rows:
+            continue
+        lines.append(f"\n[{table_name}]  {len(rows)} row(s)")
+        for idx, row in enumerate(rows, start=1):
+            cells = []
+            for k, v in row.items():
+                v_str = str(v).strip() if v is not None else ""
+                if len(v_str) > 120:
+                    v_str = v_str[:117] + "..."
+                cells.append(f"{k}={v_str}")
+            prefix = f"  ROW {idx}: " if len(rows) > 1 else "  "
+            lines.append(prefix + " | ".join(cells))
+    return "\n".join(lines)
+
+
 # ------------------------------------------------------------------
 # Structured traveler extraction (mirrors test/get_fa_data_on_sfis 6.py)
 # ------------------------------------------------------------------
@@ -455,7 +480,7 @@ def query_sn(serial_number: str, component: Optional[str] = None) -> str:
 
     session = get_session()
     try:
-        structured, _ = _query_traveler(session, serial_number)
+        structured, all_tables = _query_traveler(session, serial_number)
         if not any(structured.values()):
             print(f"[SFIS] SN '{serial_number}' not found — returning invalid SN message")
             return (
@@ -490,6 +515,7 @@ def query_sn(serial_number: str, component: Optional[str] = None) -> str:
             if val:
                 lines.append(f"{key:<24}: {val}")
 
+    lines.append(_format_full_tables(all_tables))
     output = "\n".join(lines)
     print(f"[SFIS] Returning to agent:\n{output}")
     return output
