@@ -27,7 +27,7 @@ _SN_RE = re.compile(r'\b([A-Z0-9]{8,})\b')
 
 from langgraph.graph import StateGraph, END
 
-from src.config import MAX_ITERATIONS, AGENT_VERBOSE
+from src.config import MAX_ITERATIONS
 from src.tools import ALL_TOOLS
 
 logger = logging.getLogger(__name__)
@@ -182,21 +182,25 @@ def think_node(state: AgentState) -> AgentState:
     """Ask the LLM what to do next."""
     from src.inference import get_llm
 
-    if state["iterations"] >= MAX_ITERATIONS:
+    i = state["iterations"]
+    if i >= MAX_ITERATIONS:
         return {**state, "final_answer": "Reached maximum iterations without a final answer."}
 
+    print(f"\n[AGENT] ── iter {i} ──────────────────────────────────")
+    print(f"[AGENT iter={i}] Calling LLM ...")
     prompt = _build_prompt(state, state.get("chat_history"))
     llm = get_llm()
     raw = llm.invoke(prompt, stop=["\nObservation:"])
-
-    if AGENT_VERBOSE:
-        logger.info("LLM raw output:\n%s", raw)
+    print(f"[AGENT iter={i}] Raw LLM output:\n{raw}\n---")
 
     thought, action, action_input, final_answer = _parse_llm_output(raw)
+    print(f"[AGENT iter={i}] Parsed → thought={thought[:80]!r}  action={action!r}  input={action_input!r}  final_answer={'YES' if final_answer else 'NO'}")
 
     if final_answer:
+        print(f"[AGENT iter={i}] Final Answer produced — done.")
         return {**state, "final_answer": final_answer}
 
+    print(f"[AGENT iter={i}] Tool call → {action!r}  input={action_input!r}")
     new_entry = (thought, f"{action}|{action_input}", "")
     return {
         **state,
@@ -226,13 +230,13 @@ def act_node(state: AgentState) -> AgentState:
     elif not action_input and action not in _EMPTY_INPUT_OK:
         observation = f"Error: empty Action Input for '{action}'. Provide a non-empty input or output a Final Answer."
     else:
+        print(f"[AGENT] Executing tool {action!r} with input={action_input!r}")
         try:
             observation = tool.run(action_input)
         except Exception as e:
             observation = f"Tool error: {e}"
 
-    if AGENT_VERBOSE:
-        logger.info("Tool '%s' → %s", action, observation[:200])
+    print(f"[AGENT] Tool result ({len(observation)} chars): {observation[:200]}")
 
     # Patch the last history entry with the observation
     history = list(state["history"])
@@ -345,6 +349,7 @@ def stream_agent(task: str, chat_history: list | None = None):
     yield {"type": "start", "task": task}
 
     for i in range(MAX_ITERATIONS):
+        print(f"\n[AGENT] ── iter {i} ──────────────────────────────────")
         state: AgentState = {
             "task": task,
             "history": history,
@@ -352,9 +357,11 @@ def stream_agent(task: str, chat_history: list | None = None):
             "iterations": i,
         }
         prompt = _build_prompt(state, chat_history)
+        print(f"[AGENT iter={i}] Calling LLM ...")
         raw = llm.invoke(prompt, stop=["\nObservation:"])
-        print(f"[AGENT iter={i}] raw output:\n{raw}\n---")
+        print(f"[AGENT iter={i}] Raw LLM output:\n{raw}\n---")
         thought, action, action_input, final_answer = _parse_llm_output(raw)
+        print(f"[AGENT iter={i}] Parsed → thought={thought[:80]!r}  action={action!r}  input={action_input!r}  final_answer={'YES' if final_answer else 'NO'}")
 
         if thought:
             yield {"type": "thought", "content": thought}
@@ -362,13 +369,16 @@ def stream_agent(task: str, chat_history: list | None = None):
         # Hard guard: if model skipped sfis_query for an SN query, force it now
         forced_sn, forced_result = _sfis_guard(task, final_answer, history, tool_map)
         if forced_sn:
+            print(f"[AGENT iter={i}] GUARD triggered — forcing sfis_query for SN={forced_sn}")
             yield {"type": "tool_call", "name": "sfis_query", "icon": TOOL_ICONS.get("sfis_query", "🏭"), "input": forced_sn}
             yield {"type": "tool_result", "name": "sfis_query", "output": forced_result[:2000]}
             history.append(("Forced SFIS lookup before answering.", f"sfis_query|{forced_sn}", forced_result))
+            print(f"[AGENT iter={i}] GUARD done — sfis_query result length={len(forced_result)} chars")
             final_answer = None
             continue
 
         if final_answer:
+            print(f"[AGENT iter={i}] Final Answer produced — done.")
             yield {"type": "answer", "content": final_answer}
             _sfis_tools = {"sfis_query", "sfis_2a_defects", "sfis_pvs_query"}
             used_sfis = any(act.split("|")[0] in _sfis_tools for _, act, _ in history)
@@ -381,6 +391,7 @@ def stream_agent(task: str, chat_history: list | None = None):
             break
 
         if action:
+            print(f"[AGENT iter={i}] Tool call → {action!r}  input={action_input!r}")
             yield {
                 "type": "tool_call",
                 "name": action,
@@ -396,6 +407,7 @@ def stream_agent(task: str, chat_history: list | None = None):
             else:
                 result = f"Unknown tool '{action}'. Available: {list(tool_map.keys())}"
 
+            print(f"[AGENT iter={i}] Tool result ({len(result)} chars): {result[:200]}")
             yield {"type": "tool_result", "name": action, "output": result[:2000]}
             history.append((thought, f"{action}|{action_input}", result))
         else:
