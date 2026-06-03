@@ -415,11 +415,24 @@ def _sfis_query(inp: str) -> str:
     sn = parts[0]
     component = parts[1] if len(parts) > 1 else None
     try:
-        return query_sn(sn, component)
+        result = query_sn(sn, component)
     except SFISAuthError as e:
         return f"SFIS auth error: {e}"
     except Exception as e:
         return f"SFIS query error: {e}"
+
+    # Auto-cache full SFIS data to memory so follow-up questions don't need a re-query.
+    # The 0.90 near-duplicate threshold in MemoryStore prevents duplicate entries for
+    # the same SN queried twice.
+    if "SFIS Data for SN" in result:
+        try:
+            from src.memory import MemoryStore
+            MemoryStore().add(result, source="sfis_cache")
+            print(f"[SFIS] Cached SN={sn} data to memory ({len(result)} chars)")
+        except Exception as e:
+            print(f"[SFIS] Warning: could not save to memory: {e}")
+
+    return result
 
 
 sfis_query_tool = Tool(
@@ -491,7 +504,7 @@ sfis_2a_tool = Tool(
         "Query SFIS 2A defect data for a date/time range. "
         "Returns group name, test time, error codes, and defect records. "
         "Input: comma-separated key=value pairs. "
-        "Required: from_date, to_date (format 'YYYY/MM/DD' or 'YYYY/MM/DD HH:MM'). "
+        "Required: from_date, to_date — MUST include HH:MM e.g. '2026/05/01 00:00' and '2026/05/31 23:59'. "
         "Optional: model_name, model_serial, line_name, group_name (default ALL), "
         "error_code, mo (default ALL), retest_sequence (default FIRST). "
         "Example: 'from_date=2026/05/12 00:00, to_date=2026/05/12 23:59, model_name=XY1234'"

@@ -195,6 +195,31 @@ def _convert_ec_multiline(ec_string: str) -> str:
     return "\n".join(ec.strip() for ec in ec_string.split(";") if ec.strip())
 
 
+def _format_full_tables(tables: dict) -> str:
+    """
+    Serialize all parsed SFIS tables into a compact human-readable block.
+    Each row is a single line of KEY=VALUE | KEY=VALUE pairs.
+    Empty tables are skipped. Cell values are capped at 120 chars.
+    """
+    if not tables:
+        return ""
+    lines = ["\n── Full SFIS Tables ──"]
+    for table_name, rows in tables.items():
+        if not rows:
+            continue
+        lines.append(f"\n[{table_name}]  {len(rows)} row(s)")
+        for idx, row in enumerate(rows, start=1):
+            cells = []
+            for k, v in row.items():
+                v_str = str(v).strip() if v is not None else ""
+                if len(v_str) > 120:
+                    v_str = v_str[:117] + "..."
+                cells.append(f"{k}={v_str}")
+            prefix = f"  ROW {idx}: " if len(rows) > 1 else "  "
+            lines.append(prefix + " | ".join(cells))
+    return "\n".join(lines)
+
+
 # ------------------------------------------------------------------
 # Structured traveler extraction (mirrors test/get_fa_data_on_sfis 6.py)
 # ------------------------------------------------------------------
@@ -455,7 +480,7 @@ def query_sn(serial_number: str, component: Optional[str] = None) -> str:
 
     session = get_session()
     try:
-        structured, _ = _query_traveler(session, serial_number)
+        structured, all_tables = _query_traveler(session, serial_number)
         if not any(structured.values()):
             print(f"[SFIS] SN '{serial_number}' not found — returning invalid SN message")
             return (
@@ -490,6 +515,7 @@ def query_sn(serial_number: str, component: Optional[str] = None) -> str:
             if val:
                 lines.append(f"{key:<24}: {val}")
 
+    lines.append(_format_full_tables(all_tables))
     output = "\n".join(lines)
     print(f"[SFIS] Returning to agent:\n{output}")
     return output
@@ -512,7 +538,15 @@ def query_2a_defects(
     error_code: str = "",
     retest_sequence: str = "FIRST",
 ) -> str:
-    """Query 2A defect data for a date range. Returns formatted table output."""
+    """Query 2A defect data for a date range. Returns formatted records.
+
+    Date format MUST include HH:MM, e.g. '2026/06/03 00:00' / '2026/06/03 23:59'.
+    Passing only a date (no time) causes ORA-01850 on the server.
+
+    The API returns a flat JSON array — each record has:
+      SERIAL_NUMBER, TEST_GROUP, TEST_STATION, TEST_TIME,
+      TEST_CODE, ERROR_MESSAGE, RECORD_TYPE, CNT
+    """
     print(f"\n[SFIS] ── query_2a_defects: {from_date} → {to_date}, model='{model_name}', group='{group_name}' ──")
     if not check_connectivity():
         return "SFIS server is not reachable (http://10.52.1.9). Check network connectivity."
@@ -532,7 +566,12 @@ def query_2a_defects(
             "majorProject": "", "projectName": "", "productName": "",
             "retestSequence": retest_sequence, "recordType": "ALL",
             "empNo": "ALL", "processType": "ALL",
-            "cbxGroupName": "Yes", "cbxTestTime": "Yes", "cbxErrorCode": "Yes",
+            "cbxSerialNumber": "Yes",
+            "cbxGroupName": "Yes",
+            "cbxStationName": "Yes",
+            "cbxTestTime": "Yes",
+            "cbxErrorCode": "Yes",
+            "cbxErrorMessage": "Yes",
             "group_name": group_name, "mo_number": mo,
         }
         headers = {
@@ -547,27 +586,38 @@ def query_2a_defects(
             print(f"[SFIS] ERROR — 2A query returned non-JSON")
             return "2A query returned a non-JSON response."
 
-        tables = _parse_tables_from_json(r.json())
-        if not tables:
-            print(f"[SFIS] 2A query: no records found")
-            return f"No 2A defect data found for {from_date} → {to_date}."
-        print(f"[SFIS] 2A query: {sum(len(r) for r in tables.values())} rows across {len(tables)} table(s)")
+        data = r.json()
+        if "error" in data:
+            print(f"[SFIS] ERROR — server returned error: {data['error']}")
+            return f"2A query server error: {data['error']}"
 
-        lines: list[str] = [f"2A Defects  {from_date} → {to_date}", "=" * 50]
-        for table_name, rows in tables.items():
-            if not rows:
-                continue
-            lines.append(f"\n[{table_name}]")
-            for row in rows:
-                for key, val in row.items():
-                    if val:
-                        if ";" in str(val):
-                            lines.append(f"  {key}:")
-                            for part in _convert_ec_multiline(val).splitlines():
-                                lines.append(f"    {part}")
-                        else:
-                            lines.append(f"  {key}: {val}")
-                lines.append("")
+        records = data.get("data", [])
+        total = data.get("totalcount", len(records))
+        print(f"[SFIS] 2A query: {len(records)} records returned (total={total})")
+
+        if not records:
+            return f"No 2A defect data found for {from_date} → {to_date}."
+
+        lines: list[str] = [
+            f"2A Defects  {from_date} → {to_date}  (showing {len(records)} of {total})",
+            "=" * 60,
+        ]
+        for rec in records:
+            sn      = rec.get("SERIAL_NUMBER", "")
+            group   = rec.get("TEST_GROUP", "")
+            station = rec.get("TEST_STATION", "")
+            time    = rec.get("TEST_TIME", "")
+            code    = rec.get("TEST_CODE", "")
+            msg     = rec.get("ERROR_MESSAGE", "")
+            rtype   = rec.get("RECORD_TYPE", "")
+            cnt     = rec.get("CNT", "")
+            lines.append(f"\nSN: {sn}  [{rtype}]  cnt={cnt}")
+            lines.append(f"  Group   : {group}")
+            lines.append(f"  Station : {station}")
+            lines.append(f"  Time    : {time}")
+            lines.append(f"  Code    : {code}")
+            if msg and msg != code:
+                lines.append(f"  Message : {msg}")
         return "\n".join(lines)
     finally:
         session.close()
@@ -588,7 +638,21 @@ def query_pvs(
     carton_no: str = "",
     comp_pn: str = "",
 ) -> str:
-    """Query PVS-vs-SFIS for vendor, lot, date-code, and component traceability."""
+    """Query PVS-vs-SFIS for vendor, lot, date-code, and component traceability.
+
+    At least one of sn, location, model_name, or mo must be provided.
+    Sending all-empty filters causes a full table scan and timeout.
+
+    Date format: 'YYYY/MM/DD' (no time needed, unlike 2A).
+    Response fields include: SERIAL_NUMBER, GROUP_NAME, MO_NUMBER, REEL_ID,
+    SEAT, COMP_PART_NO, PROJECT_VERSION, VENDOR, LOT_NO, DATE_CODE, etc.
+    """
+    if not any([sn, location, model_name, mo, comp_pn, carton_no]):
+        return (
+            "PVS query requires at least one filter (sn, location, model_name, mo, "
+            "comp_pn, or carton_no). Sending all-empty filters causes a timeout."
+        )
+
     print(f"\n[SFIS] ── query_pvs: sn='{sn}', location='{location}', model='{model_name}' ──")
     if not check_connectivity():
         return "SFIS server is not reachable (http://10.52.1.9). Check network connectivity."
@@ -597,7 +661,6 @@ def query_pvs(
     try:
         payload = {
             "projectver": "",
-            "disable_period": "on" if not (from_date or to_date) else "",
             "fromDate": from_date,
             "toDate": to_date,
             "buildevent": "",
@@ -617,7 +680,7 @@ def query_pvs(
             "X-Requested-With": "XMLHttpRequest",
         }
         print(f"[SFIS] Sending PVS request to {_PVS_URL}")
-        r = session.post(_PVS_URL, data=payload, headers=headers, timeout=15)
+        r = session.post(_PVS_URL, data=payload, headers=headers, timeout=30)
         print(f"[SFIS] PVS response: HTTP {r.status_code}, Content-Type: {r.headers.get('Content-Type', 'unknown')}")
         if "application/json" not in r.headers.get("Content-Type", ""):
             print(f"[SFIS] ERROR — PVS query returned non-JSON")
@@ -625,22 +688,21 @@ def query_pvs(
 
         data = r.json()
         records = data.get("data", [])
-        if not records:
-            print(f"[SFIS] PVS query: no records found")
-            return "No PVS data found for the given parameters."
-        print(f"[SFIS] PVS query: {len(records)} record(s) found")
+        total = data.get("totalcount", len(records))
+        print(f"[SFIS] PVS query: {len(records)} record(s) returned (total={total})")
 
-        lines: list[str] = ["PVS-vs-SFIS Results", "=" * 40]
-        for item in records:
-            for field, label in [
-                ("SN", "SN"), ("MODEL_NAME", "Model Name"), ("VENDOR", "Vendor"),
-                ("LOT_NO", "Lot No"), ("DATE_CODE", "Date Code"),
-                ("COMPONENT_SN", "Component SN"), ("LOCATION", "Location"),
-            ]:
-                val = item.get(field, "")
-                if val:
-                    lines.append(f"  {label:<16}: {val}")
-            lines.append("")
+        if not records:
+            return "No PVS data found for the given parameters."
+
+        lines: list[str] = [
+            f"PVS-vs-SFIS Results  (showing {len(records)} of {total})",
+            "=" * 50,
+        ]
+        for i, item in enumerate(records, start=1):
+            lines.append(f"\nRecord {i}:")
+            for key, val in item.items():
+                if val is not None and str(val).strip():
+                    lines.append(f"  {key:<20}: {val}")
         return "\n".join(lines)
     finally:
         session.close()
