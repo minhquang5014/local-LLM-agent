@@ -504,7 +504,7 @@ sfis_2a_tool = Tool(
         "Query SFIS 2A defect data for a date/time range. "
         "Returns group name, test time, error codes, and defect records. "
         "Input: comma-separated key=value pairs. "
-        "Required: from_date, to_date (format 'YYYY/MM/DD' or 'YYYY/MM/DD HH:MM'). "
+        "Required: from_date, to_date — MUST include HH:MM e.g. '2026/05/01 00:00' and '2026/05/31 23:59'. "
         "Optional: model_name, model_serial, line_name, group_name (default ALL), "
         "error_code, mo (default ALL), retest_sequence (default FIRST). "
         "Example: 'from_date=2026/05/12 00:00, to_date=2026/05/12 23:59, model_name=XY1234'"
