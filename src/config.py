@@ -6,7 +6,7 @@ MODEL_DIR = BASE_DIR / "model" / "Qwen3.5B-9B"
 
 # HuggingFace transformers settings
 HF_MODEL_PATH = str(MODEL_DIR)
-MAX_NEW_TOKENS = 512
+MAX_NEW_TOKENS = 1024
 TEMPERATURE = 0.7
 TOP_P = 0.9
 REPETITION_PENALTY = 1.1

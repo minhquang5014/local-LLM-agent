@@ -15,12 +15,36 @@ Usage:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Iterator, List, Optional
 
 from langchain_core.language_models.llms import LLM
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
 
 logger = logging.getLogger(__name__)
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove Qwen3 <think>...</think> blocks from raw model output."""
+    return _THINK_RE.sub("", text).strip()
+
+
+def _apply_qwen3_chat_template(prompt: str) -> str:
+    """
+    Wrap a raw ReAct prompt in Qwen3 chat tokens.
+
+    Without this, Qwen3 (a chat-tuned model) treats the input as a document
+    continuation and ignores the system instructions — causing it to hallucinate
+    instead of calling tools.  The empty <think>\\n\\n</think> block disables
+    thinking mode, saving ~300-400 tokens of budget.
+    """
+    return (
+        f"<|im_start|>user\n{prompt}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+        f"<think>\n\n</think>\n\n"
+    )
 
 
 # ------------------------------------------------------------------
@@ -66,16 +90,19 @@ class MlxLM(LLM):
         from mlx_lm.sample_utils import make_sampler, make_repetition_penalty
         sampler = make_sampler(temp=self.temperature, top_p=self.top_p)
         logits_processors = [make_repetition_penalty(self.repetition_penalty)]
+        formatted = _apply_qwen3_chat_template(prompt)
         raw = mlx_generate(
             self._model,
             self._tokenizer,
-            prompt=prompt,
+            prompt=formatted,
             max_tokens=self.max_tokens,
             sampler=sampler,
             logits_processors=logits_processors,
             verbose=False,
         )
-        # Qwen3.5 thinking mode appends a reasoning trace after "---". Strip it.
+        # Strip Qwen3 <think>...</think> blocks before any further processing.
+        raw = _strip_thinking(raw)
+        # Fallback: also cut at the old "---" separator some versions used.
         raw = raw.split("\n---\n")[0].strip()
         # Honour stop sequences — mlx-lm may not support them natively, so we
         # post-process here.  This is the primary defence against the model
@@ -119,15 +146,65 @@ def _build_mlx():
     return llm
 
 
+class HFChatLLM(LLM):
+    """LangChain LLM wrapper around a HuggingFace text-generation pipeline.
+
+    Applies the Qwen3 chat template before generation so the model respects
+    system instructions rather than treating the prompt as a document continuation.
+    """
+
+    max_tokens: int = 1024
+    temperature: float = 0.7
+    top_p: float = 0.9
+    repetition_penalty: float = 1.1
+
+    _pipe: Any = None
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    @property
+    def _llm_type(self) -> str:
+        return "hf-chat"
+
+    def _call(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> str:
+        formatted = _apply_qwen3_chat_template(prompt)
+        outputs = self._pipe(
+            formatted,
+            max_new_tokens=self.max_tokens,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            repetition_penalty=self.repetition_penalty,
+            do_sample=True,
+            return_full_text=False,
+        )
+        raw = outputs[0]["generated_text"] if outputs else ""
+        raw = _strip_thinking(raw)
+        # Honour stop sequences
+        effective_stop = list(stop) if stop else []
+        effective_stop += ["\nObservation:", "\nHuman:", "\nUser:"]
+        for s in effective_stop:
+            idx = raw.find(s)
+            if idx != -1:
+                raw = raw[:idx]
+        return raw.strip()
+
+
 def _build_hf_pipeline():
     import torch
     from transformers import AutoModelForCausalLM, PreTrainedTokenizerFast, pipeline
-    from langchain_community.llms import HuggingFacePipeline
     from src.config import HF_MODEL_PATH, MAX_NEW_TOKENS, TEMPERATURE, TOP_P, REPETITION_PENALTY
     import os
 
     device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Loading model via transformers on device=%s …", device)
+    print(f"[INFERENCE] Loading HF model on device={device} from {HF_MODEL_PATH}")
 
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_file=os.path.join(HF_MODEL_PATH, "tokenizer.json"),
@@ -147,14 +224,15 @@ def _build_hf_pipeline():
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        max_new_tokens=MAX_NEW_TOKENS,
+    )
+    llm = HFChatLLM(
+        max_tokens=MAX_NEW_TOKENS,
         temperature=TEMPERATURE,
         top_p=TOP_P,
         repetition_penalty=REPETITION_PENALTY,
-        do_sample=True,
-        return_full_text=False,
     )
-    return HuggingFacePipeline(pipeline=pipe)
+    llm._pipe = pipe
+    return llm
 
 
 # ------------------------------------------------------------------

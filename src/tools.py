@@ -427,14 +427,127 @@ sfis_query_tool = Tool(
     func=_sfis_query,
     description=(
         "Query the internal SFIS manufacturing system (http://10.52.1.9) for a serial number. "
+        "Automatically checks connectivity, authenticates, and validates the SN — "
+        "returns a clear message if the server is unreachable, login fails, or the SN is not found. "
         "Returns structured fields: Phase, Model, Config, SMT Line, Panel SN, "
         "SN position in panel, Failed Date, Lab In Time, Group Name, "
         "Failure Message, and List of Failing Tests. "
         "Input format: 'SERIAL_NUMBER'  or  'SERIAL_NUMBER, COMPONENT_LOCATION' "
-        "(add component location like 'R2251' to also get vendor/lot/date-code data). "
+        "(add a component location like 'R2251' or 'U7000' to also get vendor/lot/date-code data). "
         "Credentials must be saved in sfis_cred.json in the project root."
     ),
 )
+
+
+# ------------------------------------------------------------------
+# SFIS 2A defect query (time period)
+# ------------------------------------------------------------------
+
+def _sfis_2a_query(inp: str) -> str:
+    """
+    Input: comma-separated key=value pairs.
+    Required: from_date, to_date
+    Optional: model_name, model_serial, line_name, group_name, error_code, mo, retest_sequence
+    """
+    from src.sfis import query_2a_defects, SFISAuthError
+
+    params: dict[str, str] = {}
+    for part in inp.split(","):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            params[k.strip()] = v.strip()
+
+    from_date = params.get("from_date", "")
+    to_date = params.get("to_date", "")
+    if not from_date or not to_date:
+        return (
+            "Error: both from_date and to_date are required. "
+            "Example: 'from_date=2026/05/12, to_date=2026/05/12'"
+        )
+
+    try:
+        return query_2a_defects(
+            from_date=from_date,
+            to_date=to_date,
+            model_name=params.get("model_name", ""),
+            model_serial=params.get("model_serial", ""),
+            line_name=params.get("line_name", ""),
+            group_name=params.get("group_name", "ALL"),
+            error_code=params.get("error_code", ""),
+            mo=params.get("mo", "ALL"),
+            retest_sequence=params.get("retest_sequence", "FIRST"),
+        )
+    except SFISAuthError as e:
+        return f"SFIS auth error: {e}"
+    except Exception as e:
+        return f"SFIS 2A query error: {e}"
+
+
+sfis_2a_tool = Tool(
+    name="sfis_2a_defects",
+    func=_sfis_2a_query,
+    description=(
+        "Query SFIS 2A defect data for a date/time range. "
+        "Returns group name, test time, error codes, and defect records. "
+        "Input: comma-separated key=value pairs. "
+        "Required: from_date, to_date (format 'YYYY/MM/DD' or 'YYYY/MM/DD HH:MM'). "
+        "Optional: model_name, model_serial, line_name, group_name (default ALL), "
+        "error_code, mo (default ALL), retest_sequence (default FIRST). "
+        "Example: 'from_date=2026/05/12 00:00, to_date=2026/05/12 23:59, model_name=XY1234'"
+    ),
+)
+
+
+# ------------------------------------------------------------------
+# SFIS PVS-vs-SFIS query (component / vendor traceability)
+# ------------------------------------------------------------------
+
+def _sfis_pvs_query(inp: str) -> str:
+    """
+    Input: comma-separated key=value pairs.
+    Optional keys: sn, location, model_name, family, from_date, to_date, mo, carton_no, comp_pn
+    """
+    from src.sfis import query_pvs, SFISAuthError
+
+    params: dict[str, str] = {}
+    for part in inp.split(","):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            params[k.strip()] = v.strip()
+
+    try:
+        return query_pvs(
+            sn=params.get("sn", ""),
+            location=params.get("location", ""),
+            model_name=params.get("model_name", ""),
+            family=params.get("family", ""),
+            from_date=params.get("from_date", ""),
+            to_date=params.get("to_date", ""),
+            mo=params.get("mo", ""),
+            carton_no=params.get("carton_no", ""),
+            comp_pn=params.get("comp_pn", ""),
+        )
+    except SFISAuthError as e:
+        return f"SFIS auth error: {e}"
+    except Exception as e:
+        return f"SFIS PVS query error: {e}"
+
+
+sfis_pvs_tool = Tool(
+    name="sfis_pvs_query",
+    func=_sfis_pvs_query,
+    description=(
+        "Query SFIS PVS-vs-SFIS for component vendor traceability data. "
+        "Returns vendor, lot number, date code, component SN, and location for each match. "
+        "Input: comma-separated key=value pairs (all optional but at least one filter is needed). "
+        "Keys: sn (serial number), location (e.g. U7000), model_name, family, "
+        "from_date, to_date, mo, carton_no, comp_pn. "
+        "Example: 'sn=HMHHL400B0V0000LQ7, location=U7000'"
+    ),
+)
+
 
 # ------------------------------------------------------------------
 # Exported tool list
@@ -448,4 +561,6 @@ ALL_TOOLS = [
     memory_store_tool,
     memory_recall_tool,
     sfis_query_tool,
+    sfis_2a_tool,
+    sfis_pvs_tool,
 ]
