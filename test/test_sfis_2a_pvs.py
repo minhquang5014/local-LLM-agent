@@ -206,8 +206,17 @@ def test_pvs_raw(session: requests.Session):
 
     data = r.json()
     print(f"  Top-level keys: {list(data.keys())}")
+
+    # Print error details if server returned an error response
+    if "error" in data:
+        print(f"  !! Server error : {data['error']}")
+        print(f"  !! params       : {data.get('params', '')}")
+        print(f"  !! SQL          : {data.get('sql', '')[:600]}")
+        return
+
     records = data.get("data", [])
-    print(f"  Records returned: {len(records)}")
+    total   = data.get("totalcount", 0)
+    print(f"  totalcount={total}  records in response={len(records)}")
     for i, item in enumerate(records[:5]):
         print(f"  RECORD {i+1}: {json.dumps(item, indent=4)}")
     if len(records) > 5:

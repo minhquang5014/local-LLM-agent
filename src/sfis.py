@@ -687,6 +687,11 @@ def query_pvs(
             return "PVS query returned a non-JSON response."
 
         data = r.json()
+        if "error" in data:
+            print(f"[SFIS] PVS server error : {data['error']}")
+            print(f"[SFIS] PVS params       : {data.get('params', '')}")
+            print(f"[SFIS] PVS SQL          : {data.get('sql', '')[:400]}")
+            return f"PVS query server error: {data['error']}"
         records = data.get("data", [])
         total = data.get("totalcount", len(records))
         print(f"[SFIS] PVS query: {len(records)} record(s) returned (total={total})")

@@ -131,7 +131,14 @@ async def health():
 # ------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import socket
+    try:
+        local_ip = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        local_ip = "your-mac-ip"
     print("\n  Local LLM Agent")
     print("  ─────────────────────────────")
-    print("  UI → http://127.0.0.1:8088\n")
-    uvicorn.run(app, host="127.0.0.1", port=8088, log_level="warning")
+    print(f"  Local  → http://127.0.0.1:8088")
+    print(f"  Network→ http://{local_ip}:8088  (other devices on same WiFi)")
+    print()
+    uvicorn.run(app, host="0.0.0.0", port=8088, log_level="warning")

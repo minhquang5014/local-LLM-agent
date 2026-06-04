@@ -4,7 +4,11 @@
       "Bash(pip3 --version)",
       "Bash(ollama --version)",
       "Bash(brew list *)",
-      "Bash(brew --version)"
+      "Bash(brew --version)",
+      "WebFetch(domain:docs.searxng.org)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.langchain.com)"
     ]
   }
 }
