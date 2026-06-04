@@ -663,6 +663,10 @@ def query_pvs(
             "projectver": "",
             "fromDate": from_date,
             "toDate": to_date,
+            # disable_period=on switches the server from date-range filter mode to
+            # SN filter mode.  Without it the SQL binds only (fromDate, toDate, location)
+            # and ignores the sn field entirely — causing "No Data !" even for a valid SN.
+            "disable_period": "on" if sn else "",
             "buildevent": "",
             "modelname": model_name,
             "family": family,

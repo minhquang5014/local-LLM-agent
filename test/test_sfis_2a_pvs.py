@@ -174,6 +174,7 @@ def test_pvs_raw(session: requests.Session):
         "projectver": "",
         "fromDate": TEST_PVS_FROM_DATE,
         "toDate": TEST_PVS_TO_DATE,
+        "disable_period": "on",   # required when filtering by SN
         "buildevent": "",
         "modelname": TEST_PVS_MODEL_NAME,
         "family": "",
