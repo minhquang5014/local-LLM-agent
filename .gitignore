@@ -3,6 +3,7 @@ QwenPaw-main/
 sfis_cred.json
 venv/
 sample_folder/
+src/__pycache__/
 
 # SearXNG runtime files (limiter DB, uwsgi socket, cache)
 searxng/limiter.toml
