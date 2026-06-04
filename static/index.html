@@ -37,6 +37,38 @@
   --sidebar-w:260px;
   --transition:.18s ease;
 }
+/* ── Light theme ───────────────────────────────────────────────── */
+:root.light{
+  --bg:#f5f5f7;
+  --surface:#ffffff;
+  --surface2:#f0f0f5;
+  --surface3:#e4e4ec;
+  --border:rgba(0,0,0,.09);
+  --border2:rgba(0,0,0,.14);
+  --text:#1a1a2e;
+  --text-muted:#6b6b80;
+  --text-dim:#555568;
+  --accent:#6c5ce7;
+  --accent2:#4e3cc9;
+  --accent-glow:rgba(108,92,231,.15);
+  --user-bg:linear-gradient(135deg,#ede9fe,#ddd6fe);
+  --user-border:rgba(108,92,231,.3);
+  --thought-border:#c4c4d8;
+  --tool-bg:#f0fdf4;
+  --tool-border:#bbf7d0;
+  --tool-text:#16a34a;
+  --result-bg:#f8f8fc;
+  --error-bg:#fff1f2;
+  --error-border:#fecdd3;
+}
+/* theme toggle button */
+#theme-btn{
+  background:none;border:none;color:var(--text-muted);
+  cursor:pointer;padding:4px 6px;border-radius:6px;font-size:17px;
+  transition:color var(--transition),background var(--transition);
+  line-height:1;
+}
+#theme-btn:hover{color:var(--text);background:var(--surface2)}
 html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased}
 
 /* ── Layout ────────────────────────────────────────────────────── */
@@ -467,6 +499,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
         </svg>
       </button>
       <span id="chat-title">Chat</span>
+      <button id="theme-btn" onclick="toggleTheme()" title="Toggle light/dark mode">🌙</button>
       <div id="model-badge">
         <div class="status-dot" id="status-dot"></div>
         <span id="status-text">Ready</span>
@@ -516,8 +549,24 @@ let currentSessionId = null;
 let isLoading = false;
 let sidebarOpen = true;
 
+// ── Theme ──────────────────────────────────────────────────────────
+function toggleTheme() {
+  const isLight = document.documentElement.classList.toggle('light');
+  document.getElementById('theme-btn').textContent = isLight ? '☀️' : '🌙';
+  localStorage.setItem('theme', isLight ? 'light' : 'dark');
+}
+
+function applyStoredTheme() {
+  const stored = localStorage.getItem('theme');
+  if (stored === 'light') {
+    document.documentElement.classList.add('light');
+    document.getElementById('theme-btn').textContent = '☀️';
+  }
+}
+
 // ── Init ───────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
+  applyStoredTheme();
   newChat();
   loadMemory();
   autoResizeTextarea();
