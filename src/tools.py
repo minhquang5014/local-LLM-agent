@@ -414,6 +414,14 @@ def _sfis_query(inp: str) -> str:
     parts = [p.strip() for p in inp.split(",", 1)]
     sn = parts[0]
     component = parts[1] if len(parts) > 1 else None
+
+    if not sn:
+        print("[SFIS] ERROR — sfis_query called with empty SN, rejecting")
+        return (
+            "Error: serial number is empty. "
+            "Provide the SN as Action Input, e.g. 'Action Input: HMHHTX00E960000LQ7'. "
+            "Do not call sfis_query without a serial number."
+        )
     try:
         result = query_sn(sn, component)
     except SFISAuthError as e:

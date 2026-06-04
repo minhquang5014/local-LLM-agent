@@ -2,7 +2,7 @@
 When the user provides a serial number (SN) or asks about SFIS data:
 
 STEP 1 — call sfis_query immediately. This is MANDATORY. Never skip it.
-  - sfis_query checks connectivity → authenticates → queries the SN, all in one call.
+  - sfis_query checks connectivity → authenticates → queries the SN, must pass the SN onto the request URL or other wise it will not work, all in one call.
   - Credentials are pre-loaded from sfis_cred.json. Never ask the user. Never store to memory.
   - Do NOT output a Final Answer before calling sfis_query at least once.
   - Do NOT use data from previous conversations — SFIS data must always be fetched live.
