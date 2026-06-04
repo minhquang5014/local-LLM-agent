@@ -45,10 +45,26 @@ async def index():
 # Per-session conversation history:  session_id -> [(user_msg, assistant_msg), ...]
 session_histories: dict[str, list] = {}
 
+# Per-session stop events — set by /api/chat/stop to interrupt a running stream
+_stop_events: dict[str, threading.Event] = {}
+
 
 class ChatRequest(BaseModel):
     message: str
     session_id: str = "default"
+
+
+class StopRequest(BaseModel):
+    session_id: str = "default"
+
+
+@app.post("/api/chat/stop")
+async def chat_stop(req: StopRequest):
+    event = _stop_events.get(req.session_id)
+    if event:
+        event.set()
+        return {"status": "stopped"}
+    return {"status": "no active stream"}
 
 
 @app.post("/api/chat/stream")
@@ -56,15 +72,20 @@ async def chat_stream(req: ChatRequest):
     loop = asyncio.get_event_loop()
     queue: asyncio.Queue = asyncio.Queue()
 
+    stop_event = threading.Event()
+    _stop_events[req.session_id] = stop_event
+
     def _run():
         try:
             from src.agent import stream_agent
             history = list(session_histories.get(req.session_id, []))
             assistant_answer = ""
-            for event in stream_agent(req.message, history):
+            for event in stream_agent(req.message, history, stop_event=stop_event):
                 asyncio.run_coroutine_threadsafe(queue.put(event), loop)
                 if event.get("type") == "answer":
                     assistant_answer = event.get("content", "")
+                if event.get("type") in ("done", "stopped"):
+                    break
             if assistant_answer:
                 history.append((req.message, assistant_answer))
                 session_histories[req.session_id] = history
@@ -73,6 +94,7 @@ async def chat_stream(req: ChatRequest):
                 queue.put({"type": "error", "message": str(e)}), loop
             )
         finally:
+            _stop_events.pop(req.session_id, None)
             asyncio.run_coroutine_threadsafe(queue.put(None), loop)
 
     threading.Thread(target=_run, daemon=True).start()

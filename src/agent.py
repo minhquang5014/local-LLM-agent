@@ -310,7 +310,7 @@ def _sfis_guard(task: str, final_answer: Optional[str], history: list, tool_map:
     return sn, result
 
 
-def stream_agent(task: str, chat_history: list | None = None):
+def stream_agent(task: str, chat_history: list | None = None, stop_event=None):
     """Generator yielding UI events as the agent works. Used by the web server."""
     from src.inference import get_llm
 
@@ -321,6 +321,10 @@ def stream_agent(task: str, chat_history: list | None = None):
     yield {"type": "start", "task": task}
 
     for i in range(MAX_ITERATIONS):
+        if stop_event and stop_event.is_set():
+            print(f"[AGENT] Stop requested — aborting at iter {i}")
+            yield {"type": "stopped", "content": "Generation stopped by user."}
+            return
         print(f"\n[AGENT] ── iter {i} ──────────────────────────────────")
         state: AgentState = {
             "task": task,

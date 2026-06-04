@@ -378,11 +378,16 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
   background:linear-gradient(135deg,var(--accent),var(--accent2));
   color:#fff;cursor:pointer;display:flex;align-items:center;
   justify-content:center;flex-shrink:0;
-  transition:opacity var(--transition),transform var(--transition);
+  transition:background .18s ease,opacity var(--transition),transform var(--transition);
   box-shadow:0 2px 10px var(--accent-glow);
 }
 #send-btn:hover:not(:disabled){transform:scale(1.06)}
 #send-btn:disabled{opacity:.35;cursor:not-allowed;transform:none}
+#send-btn.stop-mode{
+  background:linear-gradient(135deg,#e53e3e,#c53030);
+  box-shadow:0 2px 10px rgba(229,62,62,.35);
+  opacity:1 !important;cursor:pointer !important;
+}
 #input-hint{
   font-size:11px;color:var(--text-muted);margin-top:7px;
   padding:0 4px;display:flex;justify-content:space-between;
@@ -485,9 +490,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
     <div id="input-area">
       <div id="input-wrapper">
         <textarea id="input" rows="1" placeholder="Message the agent… (Enter to send, Shift+Enter for newline)"></textarea>
-        <button id="send-btn" onclick="sendMessage()" title="Send">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+        <button id="send-btn" onclick="handleSendStop()" title="Send">
+          <svg id="send-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
             <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+          </svg>
+          <svg id="stop-icon" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="display:none">
+            <rect x="4" y="4" width="16" height="16" rx="2"/>
           </svg>
         </button>
       </div>
@@ -673,6 +681,11 @@ function handleEvent(ev, aiEl) {
       scrollToBottom();
       loadMemory();
       break;
+    case 'stopped':
+      removeTypingIndicator(aiEl);
+      appendStopped(aiEl);
+      scrollToBottom();
+      break;
     case 'error':
       removeTypingIndicator(aiEl);
       appendError(aiEl, ev.message);
@@ -777,6 +790,14 @@ function appendAnswer(aiEl, content) {
   body.appendChild(d);
 }
 
+function appendStopped(aiEl) {
+  const body = getBody(aiEl);
+  const d = document.createElement('div');
+  d.style.cssText = 'font-size:12.5px;color:var(--text-muted);padding:4px 2px;font-style:italic';
+  d.textContent = '⏹ Generation stopped.';
+  body.appendChild(d);
+}
+
 function appendError(aiEl, msg) {
   const body = getBody(aiEl);
   const d = document.createElement('div');
@@ -797,20 +818,49 @@ function toggleTool(header) {
   tog.classList.toggle('open');
 }
 
+// ── Stop generation ────────────────────────────────────────────────
+function handleSendStop() {
+  if (isLoading) {
+    stopGeneration();
+  } else {
+    sendMessage();
+  }
+}
+
+async function stopGeneration() {
+  try {
+    await fetch('/api/chat/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: String(currentSessionId) }),
+    });
+  } catch {}
+}
+
 // ── Status ─────────────────────────────────────────────────────────
 function setLoading(v) {
   isLoading = v;
-  document.getElementById('send-btn').disabled = v;
+  const btn  = document.getElementById('send-btn');
+  const send = document.getElementById('send-icon');
+  const stop = document.getElementById('stop-icon');
   document.getElementById('input').disabled = v;
-  const dot = document.getElementById('status-dot');
-  const txt = document.getElementById('status-text');
   if (v) {
-    dot.classList.add('thinking');
-    txt.textContent = 'Thinking…';
+    btn.classList.add('stop-mode');
+    btn.disabled = false;
+    btn.title = 'Stop generation';
+    send.style.display = 'none';
+    stop.style.display = 'block';
+    document.getElementById('status-dot').classList.add('thinking');
+    document.getElementById('status-text').textContent = 'Thinking…';
   } else {
-    dot.classList.remove('thinking');
-    txt.textContent = 'Ready';
-    if (!isLoading) document.getElementById('input').focus();
+    btn.classList.remove('stop-mode');
+    btn.disabled = false;
+    btn.title = 'Send';
+    send.style.display = 'block';
+    stop.style.display = 'none';
+    document.getElementById('status-dot').classList.remove('thinking');
+    document.getElementById('status-text').textContent = 'Ready';
+    document.getElementById('input').focus();
   }
 }
 
