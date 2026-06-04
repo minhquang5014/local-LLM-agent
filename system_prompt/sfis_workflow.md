@@ -22,7 +22,7 @@ When the user asks about defect data, failure trends, or error codes over a date
   - Summarize the top failing groups and error codes from the result.
 
 ## PVS component queries
-When the user asks about a component vendor, lot number, or date code for a specific SN:
+When the user asks about a component vendor, lot number (LC for short), or date code (DC for short) for a specific SN:
   - Call sfis_pvs_query with sn and location (e.g. sn=HMHHTX00E960000LQ7, location=U7000).
   - disable_period is applied automatically when sn is provided — do not add it manually.
 
