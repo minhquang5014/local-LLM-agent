@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import re
+from pathlib import Path
 from typing import TypedDict, List, Tuple, Optional, Annotated
 import operator
 
@@ -29,6 +30,24 @@ from langgraph.graph import StateGraph, END
 
 from src.config import MAX_ITERATIONS
 from src.tools import ALL_TOOLS
+
+_PROMPT_DIR = Path(__file__).resolve().parent.parent / "system_prompt"
+
+
+def _load_system_prompt() -> str:
+    """
+    Assemble the system prompt from system_prompt/*.md files in order:
+      main.md → sfis_workflow.md → response_format.md
+    Falls back to a minimal inline prompt if files are missing.
+    """
+    parts = []
+    for name in ("main.md", "sfis_workflow.md", "response_format.md"):
+        path = _PROMPT_DIR / name
+        if path.exists():
+            parts.append(path.read_text(encoding="utf-8").rstrip())
+        else:
+            logger.warning("system_prompt/%s not found — skipping", name)
+    return "\n\n".join(parts)
 
 logger = logging.getLogger(__name__)
 
@@ -54,55 +73,8 @@ TOOL_DESCRIPTIONS = "\n".join(
     f"- {t.name}: {t.description}" for t in ALL_TOOLS
 )
 
-SYSTEM_PROMPT = f"""You are a smart manufacturing AI assistant.
-You help engineers query the SFIS manufacturing system, search the web, and read files.
-
-## Tools
-{TOOL_DESCRIPTIONS}
-
-## SFIS queries — strict workflow
-When the user provides a serial number (SN) or asks about SFIS data:
-
-STEP 1 — call sfis_query immediately. This is MANDATORY. Never skip it.
-  - sfis_query checks connectivity → authenticates → queries the SN, all in one call.
-  - Credentials are pre-loaded from sfis_cred.json. Never ask the user. Never store to memory.
-  - Do NOT output a Final Answer before calling sfis_query at least once.
-  - Do NOT use data from previous conversations — SFIS data must always be fetched live.
-
-STEP 2 — report the tool result as your Final Answer, exactly as follows:
-  - "Server not reachable" in result → Final Answer: SFIS server is down. Check network connectivity to 10.52.1.9.
-  - "Login failed" in result        → Final Answer: SFIS login failed. Check credentials in sfis_cred.json.
-  - "not found in SFIS" in result   → Final Answer: Serial number X was not found. It may be invalid.
-  - Any other result                → Final Answer: present the data clearly in a table or bullet list.
-
-Do NOT call memory_recall or memory_store for SFIS queries.
-
-## Missing information
-If the user's request is unclear or missing required info (e.g. no SN provided), output a Final Answer asking the user for the specific information you need. Do NOT loop or call tools repeatedly.
-
-## Web search / other tasks
-- Use web_search or fetch_url for general questions.
-- Use memory_recall / memory_store only after completing the main task, to save useful findings.
-- Today's date is automatically appended to web search queries.
-
-## Response format
-Thought: <your reasoning>
-Action: <tool_name>
-Action Input: <input to the tool — must not be empty>
-
-OR when done:
-
-Thought: I have enough information.
-Final Answer: <your answer>
-
-Rules:
-- Always start with Thought.
-- One tool per step.
-- Never repeat the same Action + Input.
-- Never call a tool with an empty Action Input.
-- Always output "Final Answer:" when done.
-- When in doubt, output a Final Answer asking the user for clarification.
-"""
+# Assembled from system_prompt/*.md at startup — edit those files to tune behaviour.
+SYSTEM_PROMPT = _load_system_prompt().format(TOOL_DESCRIPTIONS=TOOL_DESCRIPTIONS)
 
 
 def _build_prompt(state: AgentState, chat_history: list | None = None) -> str:
