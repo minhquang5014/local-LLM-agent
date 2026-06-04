@@ -133,9 +133,14 @@ async def health():
 if __name__ == "__main__":
     import socket
     try:
-        local_ip = socket.gethostbyname(socket.gethostname())
+        # Connect a UDP socket to an external address to find the real outbound IP.
+        # No data is sent — this just makes the OS pick the right network interface.
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
     except Exception:
-        local_ip = "your-mac-ip"
+        local_ip = "run 'ifconfig | grep inet' on Mac to find your LAN IP"
     print("\n  Local LLM Agent")
     print("  ─────────────────────────────")
     print(f"  Local  → http://127.0.0.1:8088")
