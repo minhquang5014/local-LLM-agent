@@ -4,6 +4,7 @@ sfis_cred.json
 venv/
 sample_folder/
 src/__pycache__/
+output/
 
 # SearXNG runtime files (limiter DB, uwsgi socket, cache)
 searxng/limiter.toml

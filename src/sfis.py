@@ -14,12 +14,16 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import requests
 from bs4 import BeautifulSoup
+
+_OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
+_2A_INLINE_LIMIT = 200   # records above this → save to Excel, return summary only
 
 logger = logging.getLogger(__name__)
 
@@ -525,6 +529,44 @@ def query_sn(serial_number: str, component: Optional[str] = None) -> str:
 # 2A defect query (time period)
 # ------------------------------------------------------------------
 
+def _summarize_2a_records(records: list[dict]) -> str:
+    """Return a compact statistical summary of 2A defect records for the LLM."""
+    types  = Counter(r.get("RECORD_TYPE", "?") for r in records)
+    groups = Counter(r.get("TEST_GROUP", "?") for r in records)
+    codes  = Counter(r.get("TEST_CODE", "?") for r in records)
+
+    lines = [f"Total records : {len(records)}"]
+
+    lines.append("\nBy RECORD_TYPE:")
+    for t, n in sorted(types.items()):
+        lines.append(f"  {t:<6}: {n}")
+
+    lines.append("\nTop TEST_GROUPs (by count):")
+    for g, n in groups.most_common(15):
+        lines.append(f"  {n:>5}  {g}")
+
+    lines.append("\nTop TEST_CODEs (by count):")
+    for c, n in codes.most_common(20):
+        lines.append(f"  {n:>5}  {c}")
+
+    return "\n".join(lines)
+
+
+def _save_2a_to_excel(records: list[dict], from_date: str, to_date: str) -> str:
+    """Save 2A records to an Excel file in output/. Returns the file path."""
+    import pandas as pd
+
+    _OUTPUT_DIR.mkdir(exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe = lambda s: s.replace("/", "-").replace(" ", "_").replace(":", "")
+    filename = f"2A_defects_{safe(from_date)}_to_{safe(to_date)}_{ts}.xlsx"
+    filepath = _OUTPUT_DIR / filename
+    df = pd.DataFrame(records)
+    df.to_excel(filepath, index=False)
+    print(f"[SFIS] Saved {len(records)} records to {filepath}")
+    return str(filepath)
+
+
 def query_2a_defects(
     from_date: str,
     to_date: str,
@@ -598,10 +640,23 @@ def query_2a_defects(
         if not records:
             return f"No 2A defect data found for {from_date} → {to_date}."
 
-        lines: list[str] = [
-            f"2A Defects  {from_date} → {to_date}  (showing {len(records)} of {total})",
-            "=" * 60,
-        ]
+        header = f"2A Defects  {from_date} → {to_date}  ({len(records)} of {total} records)"
+
+        # Large result → summarize for LLM and save full data to Excel
+        if len(records) > _2A_INLINE_LIMIT:
+            print(f"[SFIS] {len(records)} records exceeds inline limit ({_2A_INLINE_LIMIT}) — saving to Excel")
+            try:
+                filepath = _save_2a_to_excel(records, from_date, to_date)
+                file_note = f"\nFull data saved to:\n  {filepath}"
+            except Exception as e:
+                print(f"[SFIS] Warning: could not save Excel: {e}")
+                file_note = f"\n(Excel export failed: {e})"
+
+            summary = _summarize_2a_records(records)
+            return "\n".join([header, "=" * 60, summary, file_note])
+
+        # Small result → return every record inline
+        lines: list[str] = [header, "=" * 60]
         for rec in records:
             sn      = rec.get("SERIAL_NUMBER", "")
             group   = rec.get("TEST_GROUP", "")

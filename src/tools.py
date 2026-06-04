@@ -504,7 +504,10 @@ sfis_2a_tool = Tool(
         "Query SFIS 2A defect data for a date/time range. "
         "Returns group name, test time, error codes, and defect records. "
         "Input: comma-separated key=value pairs. "
-        "Required: from_date, to_date — MUST include HH:MM e.g. '2026/05/01 00:00' and '2026/05/31 23:59'. "
+        "Required: from_date, to_date — MUST include HH:MM e.g. '2026/06/03 00:00' and '2026/06/03 23:59'. "
+        "For large result sets (>200 records) the full data is automatically saved to an Excel file "
+        "in the output/ folder and a statistical summary (breakdown by group, type, top error codes) "
+        "is returned so the LLM can answer questions without being overwhelmed by raw data. "
         "Optional: model_name, model_serial, line_name, group_name (default ALL), "
         "error_code, mo (default ALL), retest_sequence (default FIRST). "
         "Example: 'from_date=2026/05/12 00:00, to_date=2026/05/12 23:59, model_name=XY1234'"
@@ -553,11 +556,13 @@ sfis_pvs_tool = Tool(
     func=_sfis_pvs_query,
     description=(
         "Query SFIS PVS-vs-SFIS for component vendor traceability data. "
-        "Returns vendor, lot number, date code, component SN, and location for each match. "
-        "Input: comma-separated key=value pairs (all optional but at least one filter is needed). "
-        "Keys: sn (serial number), location (e.g. U7000), model_name, family, "
-        "from_date, to_date, mo, carton_no, comp_pn. "
-        "Example: 'sn=HMHHL400B0V0000LQ7, location=U7000'"
+        "Returns all fields for each matched record: SERIAL_NUMBER, GROUP_NAME, MO_NUMBER, "
+        "REEL_ID, SEAT, COMP_PART_NO, PROJECT_VERSION, VENDOR, LOT_NO, DATE_CODE, LOCATION, etc. "
+        "MUST provide at least: sn (serial number) AND location (component reference designator). "
+        "When sn is provided, disable_period is applied automatically — no date filter needed. "
+        "Input: comma-separated key=value pairs. "
+        "Keys: sn, location (e.g. U7000), model_name, family, from_date, to_date, mo, carton_no, comp_pn. "
+        "Example: 'sn=HMHHTX00E960000LQ7, location=U7000'"
     ),
 )
 
