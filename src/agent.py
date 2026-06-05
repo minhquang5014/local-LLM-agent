@@ -385,7 +385,9 @@ def stream_agent(task: str, chat_history: list | None = None, stop_event=None):
 
             print(f"[AGENT iter={i}] Tool result ({len(result)} chars): {result[:200]}")
             yield {"type": "tool_result", "name": action, "output": result[:2000]}
-            history.append((thought, f"{action}|{action_input}", result))
+            from src.rag import filter_observation
+            filtered_result = filter_observation(task, result, tool_name=action)
+            history.append((thought, f"{action}|{action_input}", filtered_result))
         else:
             yield {"type": "answer", "content": "I couldn't determine the next step. Please try rephrasing."}
             break
