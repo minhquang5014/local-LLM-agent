@@ -44,7 +44,8 @@ _MAX_CHUNK         = 700     # sub-split chunks larger than this
 _RRF_K             = 60      # RRF smoothing constant (standard value)
 
 # Tools whose results are worth filtering (large / freeform output)
-_FILTER_TOOLS = {"sfis_query", "fetch_url", "web_search", "read_file"}
+# sfis_2a_defects: statistical summary is small, but inline records (<=200) can be 20k+ chars
+_FILTER_TOOLS = {"sfis_query", "fetch_url", "web_search", "read_file", "sfis_2a_defects"}
 
 # ── Query expansion dictionary ──────────────────────────────────────
 # Maps user shorthand → expanded terms that appear in SFIS / manufacturing data
@@ -115,6 +116,35 @@ def _chunk(text: str) -> list[str]:
 
     Handles: SFIS traveler (full tables), web search, fetch_url, generic text.
     """
+
+    # 2A defect inline records: "SN: XYZ [1A/2A] cnt=N" blocks
+    # Statistical summary (>200 records) already starts with "Total records :"
+    # and is small — no chunking needed, falls through to generic handler.
+    # Inline records (<=200) have a header then one block per SN.
+    if "\nSN: " in text and ("  Group   :" in text or "  Station :" in text):
+        lines = text.split("\n")
+        header_lines: list[str] = []
+        record_blocks: list[str] = []
+        current_block: list[str] = []
+
+        in_records = False
+        for line in lines:
+            if line.startswith("SN: "):
+                if current_block:
+                    record_blocks.append("\n".join(current_block))
+                current_block = [line]
+                in_records = True
+            elif in_records:
+                current_block.append(line)
+            else:
+                header_lines.append(line)
+
+        if current_block:
+            record_blocks.append("\n".join(current_block))
+
+        header = "\n".join(header_lines).strip()
+        chunks = ([header] if header else []) + record_blocks
+        return [c for c in chunks if len(c) >= _MIN_CHUNK]
 
     # SFIS traveler: "── Full SFIS Tables ──" divider
     if "── Full SFIS Tables ──" in text:
