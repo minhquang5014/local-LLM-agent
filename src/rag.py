@@ -1,89 +1,156 @@
 """
-RAG-based tool result filter — Phase 1 (batch scoring).
+RAG-based tool result filter — hybrid retrieval edition.
 
-When a tool returns more text than the LLM needs, filter_observation()
-splits the result into logical chunks, scores each chunk against the
-user's question by cosine similarity, and returns only the most relevant
-chunks (up to MAX_OUTPUT chars total).
+Improvements over the baseline cosine-only approach:
 
-The UI always receives the full tool output unchanged.
-Only the LLM's history entry is filtered — focused signal, not noise.
+1. Query expansion      — expands SFIS/manufacturing abbreviations before scoring
+                          so "LC" → "lot number", "DC" → "date code", etc.
+                          Helps the scorer find the right chunks even when the
+                          user uses shorthand.
 
-See note/rag.md for architecture notes and Phase 2 plan.
+2. BM25 keyword scoring — pure Python BM25 (no new dependency) captures exact
+                          technical term matches: error codes, station names,
+                          component refs (R2251, U7000), SN patterns.
+                          Semantic similarity alone misses exact-match signals.
+
+3. Hybrid scoring via   — combines BM25 rank and vector rank using Reciprocal
+   Reciprocal Rank       Rank Fusion (RRF).  Neither scorer dominates; each
+   Fusion (RRF)          corrects the other's blind spots.
+
+4. Contextual headers   — SFIS table chunks are prefixed with "[From: Table Name]"
+                          so the LLM always knows which table a fact came from.
+
+5. Relevance cutoff     — RAG loop stops when scores decay below _RELEVANCE_CUTOFF.
+                          Narrow questions get 1–2 chunks; broad questions get more.
+                          Fewer tokens → faster local inference.
+
+See note/rag.md for architecture rationale and Phase 2 plan.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import re
 
 logger = logging.getLogger(__name__)
 
-# Only filter when result exceeds this length
-_FILTER_THRESHOLD = 2000
+# ── Tuneable constants ──────────────────────────────────────────────
+_FILTER_THRESHOLD  = 2000    # skip filtering when result is smaller than this
+_MAX_OUTPUT        = 1500    # max chars the LLM receives after filtering
+_RELEVANCE_CUTOFF  = 0.30    # RRF-normalised score below which chunks are dropped
+_MIN_CHUNK         = 80      # discard fragments shorter than this
+_MAX_CHUNK         = 700     # sub-split chunks larger than this
+_RRF_K             = 60      # RRF smoothing constant (standard value)
 
-# Maximum chars passed to LLM after filtering
-_MAX_OUTPUT = 1500
-
-# RAG stops adding chunks when score drops below this.
-# Narrow question ("what is vendor?") → only 1–2 high-scoring chunks pass.
-# Broad question ("tell me everything") → more chunks pass until score decays.
-# Same value as memory.py _RELEVANCE_THRESHOLD for consistency.
-_RELEVANCE_CUTOFF = 0.30
-
-# Chunk size bounds
-_MIN_CHUNK = 80
-_MAX_CHUNK = 700
-
-# Tools that can return large freeform results worth filtering
+# Tools whose results are worth filtering (large / freeform output)
 _FILTER_TOOLS = {"sfis_query", "fetch_url", "web_search", "read_file"}
 
-# Keyword stopwords for fallback scorer
+# ── Query expansion dictionary ──────────────────────────────────────
+# Maps user shorthand → expanded terms that appear in SFIS / manufacturing data
+_EXPANSIONS: dict[str, str] = {
+    # SFIS abbreviations (from sfis_workflow.md)
+    "lc":      "lot number lot_no",
+    "dc":      "date code date_code",
+    "sn":      "serial number serial_number",
+    "mo":      "manufacturing order mo_number",
+    "pn":      "part number comp_part_no",
+    "bom":     "bill of materials hw_bom sw_bom",
+    "pvs":     "pvs vendor component traceability",
+    # Test station shorthand
+    "fct":     "functional circuit test fct",
+    "bi":      "burn in burn_in",
+    "burn":    "burn in burn_in",
+    "wifi":    "wifi wireless test",
+    "dfu":     "device firmware update dfu",
+    # Failure / quality terms
+    "fail":    "failed failure failing test_code error",
+    "pass":    "passed passing qa_result",
+    "vendor":  "vendor manufacturer tsmc supply",
+    "phase":   "phase version_code dvt evt mp",
+    "model":   "model hw_bom product family",
+    "config":  "config sw_bom configuration",
+    "line":    "line virtual_line1 smt production",
+    "panel":   "panel smt panel_sn track_no",
+    "group":   "group test_group group_name",
+    "station": "station test_station",
+}
+
+# Standard stopwords to ignore during BM25 tokenisation
 _STOPWORDS = {
     "a", "an", "the", "is", "was", "are", "were", "be", "been", "being",
     "have", "has", "had", "do", "does", "did", "will", "would", "could",
     "should", "may", "might", "can", "for", "in", "on", "at", "to", "of",
     "and", "or", "but", "not", "with", "this", "that", "what", "how",
     "me", "my", "i", "you", "your", "it", "its", "about", "from", "get",
+    "please", "tell", "show", "give", "find", "check", "query",
 }
 
 
-# ------------------------------------------------------------------
-# Chunking
-# ------------------------------------------------------------------
+# ── 1. Query expansion ──────────────────────────────────────────────
+
+def _expand_query(question: str) -> str:
+    """
+    Append expanded terms for known abbreviations found in the question.
+    Original question is preserved; expansions are appended so the scorer
+    sees both the original phrasing and the full technical terms.
+
+    Example: "what is the LC for this SN?" →
+             "what is the LC for this SN? lot number lot_no serial number serial_number"
+    """
+    words = re.findall(r'\w+', question.lower())
+    extra: list[str] = []
+    for word in words:
+        if word in _EXPANSIONS:
+            extra.append(_EXPANSIONS[word])
+    return (question + " " + " ".join(extra)).strip() if extra else question
+
+
+# ── 2. Chunking with contextual headers ────────────────────────────
 
 def _chunk(text: str) -> list[str]:
     """
-    Split text into logical chunks based on the format it came from.
+    Split text into logical chunks, adding a contextual header to each
+    SFIS table chunk so the LLM knows which table the data came from.
 
-    Handles: SFIS full tables, web search results, fetch_url output,
-    and generic paragraph text.
+    Handles: SFIS traveler (full tables), web search, fetch_url, generic text.
     """
 
-    # SFIS traveler: "── Full SFIS Tables ──" separates structured summary from tables
+    # SFIS traveler: "── Full SFIS Tables ──" divider
     if "── Full SFIS Tables ──" in text:
         parts = text.split("\n── Full SFIS Tables ──", 1)
-        summary = parts[0].strip()          # 11-field structured block — always keep
+        summary = parts[0].strip()       # 11-field block — always first chunk
         tables_section = parts[1] if len(parts) > 1 else ""
-        # Each table starts with a "[Table Name]" header on its own line
-        table_chunks = re.split(r'\n(?=\[)', tables_section)
-        chunks = [summary] + [c.strip() for c in table_chunks if c.strip()]
-        return [c for c in chunks if len(c) >= _MIN_CHUNK]
 
-    # Web search results separated by ---
+        # Split into individual tables at each "[Table Name]" header
+        raw_tables = re.split(r'\n(?=\[)', tables_section)
+        table_chunks: list[str] = []
+        for raw in raw_tables:
+            raw = raw.strip()
+            if not raw or len(raw) < _MIN_CHUNK:
+                continue
+            # Extract table name for the contextual header
+            m = re.match(r'\[([^\]]+)\]', raw)
+            table_name = m.group(1) if m else "SFIS Table"
+            # Prefix with contextual header so LLM knows the source
+            header = f"[From: {table_name}]"
+            chunk = f"{header}\n{raw}"
+            table_chunks.append(chunk)
+
+        return [summary] + table_chunks
+
+    # Web search results
     if "\n---\n" in text:
         chunks = [c.strip() for c in text.split("\n---\n") if c.strip()]
         return [c for c in chunks if len(c) >= _MIN_CHUNK]
 
-    # fetch_url already split with ---CHUNK BREAK---
+    # fetch_url chunks
     if "---CHUNK BREAK---" in text:
         chunks = [c.strip() for c in text.split("---CHUNK BREAK---") if c.strip()]
         return [c for c in chunks if len(c) >= _MIN_CHUNK]
 
-    # Generic text: split on blank lines first
+    # Generic: split on blank lines
     raw_chunks = [c.strip() for c in re.split(r'\n\n+', text) if c.strip()]
-
-    # Sub-split any chunk that's too large
     result: list[str] = []
     for chunk in raw_chunks:
         if len(chunk) <= _MAX_CHUNK:
@@ -106,34 +173,47 @@ def _chunk(text: str) -> list[str]:
     return [c for c in result if len(c) >= _MIN_CHUNK]
 
 
-# ------------------------------------------------------------------
-# Scoring
-# ------------------------------------------------------------------
+# ── 3. BM25 scoring ────────────────────────────────────────────────
 
-def _keyword_score(question: str, chunk: str) -> float:
+def _tokenise(text: str) -> list[str]:
+    return [
+        w.lower() for w in re.findall(r'\w+', text)
+        if w.lower() not in _STOPWORDS and len(w) > 1
+    ]
+
+
+def _bm25_scores(query_tokens: list[str], chunks: list[str],
+                 k1: float = 1.5, b: float = 0.75) -> list[float]:
     """
-    Keyword overlap score (fallback when embeddings unavailable).
-    Returns 0.0–1.0: fraction of significant question words found in chunk.
+    BM25 relevance score for each chunk vs. query_tokens.
+    Pure Python — no external dependency.
     """
-    q_words = {
-        w.lower() for w in re.findall(r'\w+', question)
-        if w.lower() not in _STOPWORDS and len(w) > 2
-    }
-    if not q_words:
-        return 0.0
-    chunk_lower = chunk.lower()
-    hits = sum(1 for w in q_words if w in chunk_lower)
-    return hits / len(q_words)
+    tokenised = [_tokenise(c) for c in chunks]
+    n = len(chunks)
+    avgdl = sum(len(t) for t in tokenised) / n if n else 1
+
+    scores: list[float] = []
+    for doc_tokens in tokenised:
+        dl = len(doc_tokens)
+        score = 0.0
+        for term in set(query_tokens):          # unique query terms
+            tf = doc_tokens.count(term)
+            df = sum(1 for dt in tokenised if term in dt)
+            if df == 0:
+                continue
+            idf = math.log((n - df + 0.5) / (df + 0.5) + 1.0)
+            tf_norm = tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl / avgdl))
+            score += idf * tf_norm
+        scores.append(score)
+    return scores
 
 
-def _score_chunks(question: str, chunks: list[str]) -> list[tuple[float, str]]:
+# ── 4. Vector scoring ───────────────────────────────────────────────
+
+def _vector_scores(question: str, chunks: list[str]) -> list[float] | None:
     """
-    Score each chunk against the question.
-    Returns [(score, chunk), ...] sorted by score descending.
-
-    Primary:  cosine similarity via ChromaDB's DefaultEmbeddingFunction
-              (all-MiniLM-L6-v2, already loaded for MemoryStore — no extra cost).
-    Fallback: keyword overlap score if embedding fails.
+    Cosine similarity via ChromaDB's DefaultEmbeddingFunction (all-MiniLM-L6-v2).
+    Returns None on failure so the caller can fall back to BM25-only.
     """
     try:
         from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
@@ -145,29 +225,78 @@ def _score_chunks(question: str, chunks: list[str]) -> list[tuple[float, str]]:
         q_emb = np.array(embeddings[0], dtype=float)
         q_norm = np.linalg.norm(q_emb)
         if q_norm == 0:
-            raise ValueError("zero question embedding")
+            return None
         q_emb /= q_norm
 
-        scored: list[tuple[float, str]] = []
-        for i, chunk in enumerate(chunks):
+        scores: list[float] = []
+        for i in range(len(chunks)):
             c_emb = np.array(embeddings[i + 1], dtype=float)
             c_norm = np.linalg.norm(c_emb)
-            score = float(np.dot(q_emb, c_emb / c_norm)) if c_norm > 0 else 0.0
-            scored.append((score, chunk))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return scored
+            scores.append(float(np.dot(q_emb, c_emb / c_norm)) if c_norm > 0 else 0.0)
+        return scores
 
     except Exception as e:
-        logger.debug("Embedding scoring failed (%s) — using keyword fallback", e)
-        scored = [(_keyword_score(question, c), c) for c in chunks]
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return scored
+        logger.debug("Vector scoring failed: %s", e)
+        return None
 
 
-# ------------------------------------------------------------------
-# Public API
-# ------------------------------------------------------------------
+# ── 5. Reciprocal Rank Fusion ───────────────────────────────────────
+
+def _rrf_combine(scores_list: list[list[float]], k: int = _RRF_K) -> list[float]:
+    """
+    Combine multiple ranking signals via Reciprocal Rank Fusion.
+    Each score list is converted to a rank ordering; RRF fuses the ranks.
+    Returns a combined score per chunk (higher = more relevant).
+    """
+    n = len(scores_list[0])
+    combined = [0.0] * n
+
+    for scores in scores_list:
+        # Rank: index 0 = best rank
+        ranked = sorted(range(n), key=lambda i: scores[i], reverse=True)
+        rank_of = [0] * n
+        for rank, idx in enumerate(ranked):
+            rank_of[idx] = rank
+        for i in range(n):
+            combined[i] += 1.0 / (k + rank_of[i] + 1)
+
+    # Normalise to 0–1
+    max_score = max(combined) if combined else 1.0
+    if max_score > 0:
+        combined = [s / max_score for s in combined]
+    return combined
+
+
+# ── 6. Hybrid scoring entry point ──────────────────────────────────
+
+def _hybrid_score(question: str, chunks: list[str]) -> list[tuple[float, str]]:
+    """
+    Score each chunk using BM25 + vector cosine similarity combined via RRF.
+    Falls back to BM25-only if vector scoring is unavailable.
+    Returns [(hybrid_score, chunk), ...] sorted descending.
+    """
+    expanded = _expand_query(question)
+    query_tokens = _tokenise(expanded)
+
+    bm25 = _bm25_scores(query_tokens, chunks)
+    vector = _vector_scores(expanded, chunks)
+
+    if vector is not None:
+        combined = _rrf_combine([bm25, vector])
+        method = "BM25+vector RRF"
+    else:
+        # Normalise BM25 to 0–1 as fallback
+        mx = max(bm25) if bm25 else 1.0
+        combined = [s / mx if mx > 0 else 0.0 for s in bm25]
+        method = "BM25-only"
+
+    scored = list(zip(combined, chunks))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    logger.debug("Hybrid scoring method: %s", method)
+    return scored
+
+
+# ── Public API ──────────────────────────────────────────────────────
 
 def filter_observation(
     question: str,
@@ -178,28 +307,19 @@ def filter_observation(
     relevance_cutoff: float = _RELEVANCE_CUTOFF,
 ) -> str:
     """
-    Return only the chunks of `text` that are relevant to `question`.
+    Return only the chunks of `text` most relevant to `question`.
 
-    How the RAG loop works:
-    1. Split text into logical chunks (by table / search result / paragraph).
-    2. Score every chunk against the question using cosine similarity.
-    3. Sort by score descending — most relevant first.
-    4. Loop through scored chunks and add each to the context IF:
-         a. Its score is >= relevance_cutoff  (RAG gate — stops when relevance decays)
-         b. The accumulated context is still within max_output chars
-       Stop as soon as either condition fails.
-    5. The LLM receives only the accumulated context.
+    Pipeline:
+      expand_query → chunk → BM25+vector hybrid score via RRF →
+      relevance-cutoff loop → return top chunks ≤ max_output chars
 
-    This means a narrow question ("what is the vendor?") gets 1–2 chunks.
-    A broad question gets more, until scores drop below the cutoff.
-    Fewer tokens → faster LLM inference.
-
-    The first chunk (structured summary / header) is always kept regardless of
-    score — it provides the LLM with essential context to frame its answer.
+    The first chunk (structured summary / header) is always kept.
+    The UI receives the full unfiltered result; only the LLM history entry
+    is filtered.
 
     Passes through unchanged when:
-    - text <= threshold chars (no filtering needed)
-    - tool_name not in _FILTER_TOOLS (result is already compact)
+    - len(text) <= threshold  (small results need no filtering)
+    - tool_name not in _FILTER_TOOLS  (result already compact)
     """
     if not text or len(text) <= threshold:
         return text
@@ -211,12 +331,16 @@ def filter_observation(
     if len(chunks) <= 1:
         return text[:max_output]
 
+    expanded_q = _expand_query(question)
+    if expanded_q != question:
+        print(f"[RAG] query expanded: {question[:50]!r} → {expanded_q[:80]!r}")
+
     print(f"[RAG] {tool_name or 'tool'}: {len(text)} chars → {len(chunks)} chunks | "
-          f"cutoff={relevance_cutoff} | question: {question[:70]!r}")
+          f"cutoff={relevance_cutoff} | q: {question[:60]!r}")
 
-    scored = _score_chunks(question, chunks)
+    scored = _hybrid_score(question, chunks)
 
-    # Always include first chunk (structured summary / header)
+    # First chunk = structured summary / header — always include
     first = chunks[0]
     rest = [(s, c) for s, c in scored if c != first]
 
@@ -224,13 +348,12 @@ def filter_observation(
     used = len(first)
 
     for score, chunk in rest:
-        # RAG gate: stop when relevance decays below cutoff
+        # RAG gate: stop when relevance decays
         if score < relevance_cutoff:
-            print(f"[RAG] score {score:.3f} < cutoff {relevance_cutoff} — stopping loop "
-                  f"({len(chunks) - len(selected)} remaining chunks skipped)")
+            skipped = len(chunks) - len(selected)
+            print(f"[RAG] score {score:.3f} < cutoff → stop ({skipped} chunks skipped)")
             break
 
-        # Budget gate: stop when context is full
         if used >= max_output:
             break
 
@@ -238,16 +361,14 @@ def filter_observation(
         if len(chunk) <= remaining:
             selected.append(chunk)
             used += len(chunk)
-            print(f"[RAG]   + chunk (score={score:.3f}, {len(chunk)} chars)")
-        else:
-            # Fits partially and score is strong — take a slice
-            if remaining > 120:
-                selected.append(chunk[:remaining - 1] + "…")
-                used = max_output
-                print(f"[RAG]   + chunk truncated (score={score:.3f})")
+            print(f"[RAG]   + {chunk[:40]!r}… (score={score:.3f}, {len(chunk)} chars)")
+        elif remaining > 120:
+            selected.append(chunk[:remaining - 1] + "…")
+            used = max_output
+            print(f"[RAG]   + truncated (score={score:.3f})")
             break
 
-    print(f"[RAG] result: {len(selected)}/{len(chunks)} chunks kept → {used} chars "
-          f"(top score={scored[0][0]:.3f})")
+    print(f"[RAG] ✓ {len(selected)}/{len(chunks)} chunks → {used} chars "
+          f"(top={scored[0][0]:.3f})")
 
     return "\n\n".join(selected)
