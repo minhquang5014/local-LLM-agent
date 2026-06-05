@@ -25,6 +25,12 @@ _FILTER_THRESHOLD = 2000
 # Maximum chars passed to LLM after filtering
 _MAX_OUTPUT = 1500
 
+# RAG stops adding chunks when score drops below this.
+# Narrow question ("what is vendor?") → only 1–2 high-scoring chunks pass.
+# Broad question ("tell me everything") → more chunks pass until score decays.
+# Same value as memory.py _RELEVANCE_THRESHOLD for consistency.
+_RELEVANCE_CUTOFF = 0.30
+
 # Chunk size bounds
 _MIN_CHUNK = 80
 _MAX_CHUNK = 700
@@ -169,16 +175,31 @@ def filter_observation(
     tool_name: str = "",
     threshold: int = _FILTER_THRESHOLD,
     max_output: int = _MAX_OUTPUT,
+    relevance_cutoff: float = _RELEVANCE_CUTOFF,
 ) -> str:
     """
-    Return the portion of `text` most relevant to `question`.
+    Return only the chunks of `text` that are relevant to `question`.
+
+    How the RAG loop works:
+    1. Split text into logical chunks (by table / search result / paragraph).
+    2. Score every chunk against the question using cosine similarity.
+    3. Sort by score descending — most relevant first.
+    4. Loop through scored chunks and add each to the context IF:
+         a. Its score is >= relevance_cutoff  (RAG gate — stops when relevance decays)
+         b. The accumulated context is still within max_output chars
+       Stop as soon as either condition fails.
+    5. The LLM receives only the accumulated context.
+
+    This means a narrow question ("what is the vendor?") gets 1–2 chunks.
+    A broad question gets more, until scores drop below the cutoff.
+    Fewer tokens → faster LLM inference.
+
+    The first chunk (structured summary / header) is always kept regardless of
+    score — it provides the LLM with essential context to frame its answer.
 
     Passes through unchanged when:
-    - text is shorter than `threshold` chars
-    - tool_name is not in _FILTER_TOOLS (e.g. sfis_2a_defects already summarised)
-
-    Otherwise: chunk → embed-score → keep top chunks up to `max_output` chars.
-    The first chunk (structured summary / header) is always kept.
+    - text <= threshold chars (no filtering needed)
+    - tool_name not in _FILTER_TOOLS (result is already compact)
     """
     if not text or len(text) <= threshold:
         return text
@@ -190,11 +211,12 @@ def filter_observation(
     if len(chunks) <= 1:
         return text[:max_output]
 
-    print(f"[RAG] {tool_name or 'tool'}: {len(text)} chars → {len(chunks)} chunks | question: {question[:70]!r}")
+    print(f"[RAG] {tool_name or 'tool'}: {len(text)} chars → {len(chunks)} chunks | "
+          f"cutoff={relevance_cutoff} | question: {question[:70]!r}")
 
     scored = _score_chunks(question, chunks)
 
-    # The first chunk is the summary / header — always include it regardless of score
+    # Always include first chunk (structured summary / header)
     first = chunks[0]
     rest = [(s, c) for s, c in scored if c != first]
 
@@ -202,19 +224,30 @@ def filter_observation(
     used = len(first)
 
     for score, chunk in rest:
+        # RAG gate: stop when relevance decays below cutoff
+        if score < relevance_cutoff:
+            print(f"[RAG] score {score:.3f} < cutoff {relevance_cutoff} — stopping loop "
+                  f"({len(chunks) - len(selected)} remaining chunks skipped)")
+            break
+
+        # Budget gate: stop when context is full
         if used >= max_output:
             break
+
         remaining = max_output - used
         if len(chunk) <= remaining:
             selected.append(chunk)
             used += len(chunk)
-        elif score > 0.45 and remaining > 120:
-            # High relevance but tight budget — fit a truncated slice
-            selected.append(chunk[:remaining - 1] + "…")
-            used = max_output
+            print(f"[RAG]   + chunk (score={score:.3f}, {len(chunk)} chars)")
+        else:
+            # Fits partially and score is strong — take a slice
+            if remaining > 120:
+                selected.append(chunk[:remaining - 1] + "…")
+                used = max_output
+                print(f"[RAG]   + chunk truncated (score={score:.3f})")
             break
 
-    print(f"[RAG] kept {len(selected)}/{len(chunks)} chunks → {used} chars "
-          f"(dropped {len(chunks) - len(selected)}, top score={scored[0][0]:.3f})")
+    print(f"[RAG] result: {len(selected)}/{len(chunks)} chunks kept → {used} chars "
+          f"(top score={scored[0][0]:.3f})")
 
     return "\n\n".join(selected)
