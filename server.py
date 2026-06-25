@@ -28,7 +28,24 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Local LLM Agent", docs_url=None, redoc_url=None)
-app.add_middleware(GZipMiddleware, minimum_size=500)
+
+
+class SelectiveGZipMiddleware(GZipMiddleware):
+    """GZip everything EXCEPT the SSE stream.
+
+    Compressing a StreamingResponse buffers chunks and corrupts real-time SSE
+    delivery (the final answer event would never reach the browser). We skip
+    gzip for the chat stream and keep it for the one-time HTML/JS/JSON payloads.
+    """
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("path", "").startswith("/api/chat/stream"):
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
+
+app.add_middleware(SelectiveGZipMiddleware, minimum_size=500)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ------------------------------------------------------------------
@@ -38,6 +55,11 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return (Path(__file__).parent / "static" / "index.html").read_text()
+
+
+# Serve vendored static assets (marked.min.js, etc.) so the UI works fully
+# offline — the manufacturing LAN has no access to public CDNs.
+app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
 
 
 # ------------------------------------------------------------------

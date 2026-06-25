@@ -6,7 +6,7 @@
 <title>Local LLM Agent</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="/static/marked.min.js"></script>
 <style>
 /* ── Reset & Variables ─────────────────────────────────────────── */
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -277,18 +277,30 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 }
 .ai-card-body{padding:14px 16px;display:flex;flex-direction:column;gap:10px}
 
-/* Thought block */
+/* Thought block — collapsible */
 .thought-block{
-  font-size:12.5px;color:var(--text-muted);
   border-left:2px solid var(--thought-border);
-  padding:4px 0 4px 10px;
-  font-style:italic;line-height:1.6;
+  padding-left:10px;
+}
+.thought-header{
+  display:flex;align-items:center;gap:6px;cursor:pointer;
+  user-select:none;padding:3px 0;
 }
 .thought-label{
   font-size:10.5px;font-weight:600;letter-spacing:.05em;
-  text-transform:uppercase;color:var(--text-muted);opacity:.7;
-  margin-bottom:2px;font-style:normal;
+  text-transform:uppercase;color:var(--text-muted);opacity:.75;
 }
+.thought-toggle{
+  font-size:9px;color:var(--text-muted);
+  transition:transform var(--transition);
+}
+.thought-toggle.collapsed{transform:rotate(-90deg)}
+.thought-body{
+  font-size:12.5px;color:var(--text-muted);
+  font-style:italic;line-height:1.6;
+  padding:2px 0 5px;overflow:hidden;
+}
+.thought-body.collapsed{display:none}
 
 /* Tool call card */
 .tool-card{
@@ -331,6 +343,16 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 .tool-result.visible{display:block}
 
 /* Final answer */
+.answer-block{
+  border-top:1px solid var(--border);
+  margin-top:4px;padding-top:12px;
+}
+.answer-block:first-child{border-top:none;margin-top:0;padding-top:0}
+.answer-label{
+  font-size:10.5px;font-weight:600;letter-spacing:.05em;
+  text-transform:uppercase;color:var(--accent);
+  display:flex;align-items:center;gap:6px;margin-bottom:7px;
+}
 .answer-text{
   font-size:14px;line-height:1.75;color:var(--text);
   word-break:break-word;
@@ -584,7 +606,10 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 });
 
-marked.setOptions({ breaks: true, gfm: true });
+// Guard: if marked failed to load (e.g. offline with no local copy), keep the
+// rest of the app working — appendAnswer falls back to plain text.
+const hasMarked = typeof marked !== 'undefined';
+if (hasMarked) marked.setOptions({ breaks: true, gfm: true });
 
 // ── Session management ─────────────────────────────────────────────
 function newChat() {
@@ -686,7 +711,8 @@ async function sendMessage() {
       buf = lines.pop();
       for (const line of lines) {
         if (line.startsWith('data: ')) {
-          try { handleEvent(JSON.parse(line.slice(6)), aiEl); } catch {}
+          try { handleEvent(JSON.parse(line.slice(6)), aiEl); }
+          catch (e) { console.error('SSE parse error:', e, line); }
         }
       }
     }
@@ -799,8 +825,26 @@ function appendThought(aiEl, content) {
   const body = getBody(aiEl);
   const d = document.createElement('div');
   d.className = 'thought-block';
-  d.innerHTML = `<div class="thought-label">💭 Thinking</div>${escHtml(content)}`;
+  d.innerHTML = `
+    <div class="thought-header" onclick="toggleThought(this)">
+      <span class="thought-label">💭 Reasoning</span>
+      <span class="thought-toggle">▼</span>
+    </div>
+    <div class="thought-body">${escHtml(content)}</div>`;
   body.appendChild(d);
+}
+
+function toggleThought(header) {
+  const block = header.parentElement;
+  block.querySelector('.thought-body')?.classList.toggle('collapsed');
+  header.querySelector('.thought-toggle')?.classList.toggle('collapsed');
+}
+
+function collapseThoughts(aiEl) {
+  aiEl.querySelectorAll('.thought-block').forEach(b => {
+    b.querySelector('.thought-body')?.classList.add('collapsed');
+    b.querySelector('.thought-toggle')?.classList.add('collapsed');
+  });
 }
 
 function appendToolCall(aiEl, ev) {
@@ -833,12 +877,35 @@ function attachToolResult(aiEl, name, output) {
   }
 }
 
+function renderMarkdown(text) {
+  text = text || '';
+  if (hasMarked) {
+    try { return marked.parse(text); } catch (e) { /* fall through */ }
+  }
+  // Minimal offline fallback: escape, then basic bold/code/line breaks so the
+  // answer is at least readable when the markdown library is unavailable.
+  let h = escHtml(text);
+  h = h.replace(/```([\s\S]*?)```/g, (_, c) => `<pre><code>${c.trim()}</code></pre>`);
+  h = h.replace(/`([^`]+)`/g, '<code>$1</code>');
+  h = h.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  h = h.replace(/\n/g, '<br>');
+  return h;
+}
+
 function appendAnswer(aiEl, content) {
   const body = getBody(aiEl);
+  collapseThoughts(aiEl);            // tuck away reasoning so the answer stands out
+  const block = document.createElement('div');
+  block.className = 'answer-block';
+  const label = document.createElement('div');
+  label.className = 'answer-label';
+  label.innerHTML = '✦ Answer';
   const d = document.createElement('div');
   d.className = 'answer-text';
-  d.innerHTML = marked.parse(content);
-  body.appendChild(d);
+  d.innerHTML = renderMarkdown(content);
+  block.appendChild(label);
+  block.appendChild(d);
+  body.appendChild(block);
 }
 
 function appendStopped(aiEl) {
