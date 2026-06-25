@@ -93,7 +93,7 @@ def _build_prompt(state: AgentState, chat_history: list | None = None) -> str:
     # Inject recent conversation so the model can answer follow-ups
     if chat_history:
         lines.append("\n## Conversation History")
-        for user_msg, assistant_msg in chat_history[-6:]:
+        for user_msg, assistant_msg in chat_history[-4:]:
             lines.append(f"User: {user_msg}")
             short = assistant_msg[:600] + "…" if len(assistant_msg) > 600 else assistant_msg
             lines.append(f"Assistant: {short}")
@@ -367,6 +367,16 @@ def stream_agent(task: str, chat_history: list | None = None, stop_event=None):
             break
 
         if action:
+            # Auto-fix: sfis_query must receive a SN — extract from task if LLM left it empty
+            if action == "sfis_query" and not action_input.strip():
+                m = _SN_RE.search(task)
+                if m:
+                    action_input = m.group(1)
+                    print(f"[AGENT iter={i}] Auto-substituted SN={action_input} for empty sfis_query input")
+                else:
+                    yield {"type": "answer", "content": "Please provide a serial number (SN) to query SFIS."}
+                    break
+
             print(f"[AGENT iter={i}] Tool call → {action!r}  input={action_input!r}")
             yield {
                 "type": "tool_call",
