@@ -9,13 +9,15 @@ Local ReAct agent running the Qwen3-9B model (safetensors format). Capabilities:
 
 ## Architecture
 
-- `src/agent.py` — LangGraph ReAct loop (think → act → respond)
-- `src/inference.py` — LLM backend: Ollama → mlx-lm → transformers (auto-fallback)
-- `src/tools.py` — 7 LangChain tools (web_search, fetch_url, read_file, list_dir, memory_store, memory_recall, sfis_query)
-- `src/memory.py` — ChromaDB vector store for persistent memory
-- `src/sfis.py` — Headless SFIS client (http://10.52.1.9)
-- `server.py` — FastAPI + SSE streaming web server (port 8088)
-- `static/index.html` — Dark-theme chat UI
+- `src/agent.py` — LangGraph ReAct loop (think → act → respond) + sfis guard + stop_event
+- `src/inference.py` — LLM backend: Ollama → mlx-lm → transformers (auto-fallback), Qwen3 chat template
+- `src/tools.py` — 9 LangChain tools (web_search, fetch_url, read_file, list_dir, memory_store, memory_recall, sfis_query, sfis_2a_defects, sfis_pvs_query)
+- `src/memory.py` — ChromaDB vector store (relevance threshold 0.30, near-duplicate check 0.90, timestamps)
+- `src/sfis.py` — Headless SFIS client (http://10.52.1.9): traveler, 2A defects, PVS traceability
+- `src/rag.py` — RAG filter: BM25 + vector hybrid scoring via RRF, query expansion, relevance cutoff
+- `server.py` — FastAPI + SSE streaming + GZip middleware (port 8088), stop endpoint
+- `static/index.html` — Chat UI with dark/light theme toggle, stop button
+- `system_prompt/` — System prompt files: main.md, sfis_workflow.md, response_format.md
 
 ---
 
@@ -25,24 +27,33 @@ Local ReAct agent running the Qwen3-9B model (safetensors format). Capabilities:
 flowchart TD
     A([User types a message]) --> B
 
-    subgraph UI ["Browser UI  —  static/index.html"]
+    subgraph UI ["Browser UI  —  static/index.html  ·  dark/light theme"]
         B[Send via SSE\nPOST /api/chat/stream]
+        STOP_BTN[Stop button pressed\nPOST /api/chat/stop]
     end
 
     B --> C
 
-    subgraph SERVER ["Web Server  —  server.py"]
-        C[FastAPI receives request\nattaches session history]
+    subgraph SERVER ["Web Server  —  server.py  ·  GZip middleware"]
+        C[FastAPI receives request\nattaches session history\ncreates stop_event per session]
+        STOP_EP[/api/chat/stop\nsets stop_event for session]
     end
+
+    STOP_BTN --> STOP_EP
 
     C --> D
 
     subgraph AGENT ["ReAct Loop  —  src/agent.py  ·  max 10 iterations"]
-        D[Build Prompt] --> D1
-        D1[Inject chat history\nlast 6 turns] --> D2
-        D2[Auto memory recall\nChromaDB semantic search\ninjected as Relevant Memories] --> E
+        D[Build Prompt] --> D0
+        D0[Load system_prompt/*.md\nmain · sfis_workflow · response_format] --> D1
+        D1[Inject chat history\nlast 4 turns] --> D2
+        D2[Auto memory recall\nChromaDB semantic search\ninjected as Relevant Memories] --> STOP_CHK
 
-        E[LLM Inference\nsrc/inference.py] --> E1
+        STOP_CHK{stop_event\nset?}
+        STOP_CHK -->|Yes| STOPPED[Emit stopped event\nabort loop]
+        STOP_CHK -->|No| E
+
+        E[LLM Inference\nsrc/inference.py\nQwen3 chat template applied] --> E1
 
         subgraph LLM ["LLM Backend  —  auto-selected"]
             E1{Is Ollama running?}
@@ -54,12 +65,20 @@ flowchart TD
 
         E2 & E4 & E5 --> F
 
-        F[Parse LLM output] --> G{Output type?}
+        F[Parse LLM output\nstrip think blocks\ncut hallucinated Observations] --> G{Output type?}
 
-        G -->|Thought + Action| H[Execute Tool]
-        G -->|Final Answer| DONE[Exit loop]
+        G -->|Thought + Action| GUARD
+        G -->|Final Answer| SFIS_GUARD
 
-        subgraph TOOLS ["Tools  —  src/tools.py"]
+        GUARD{sfis_query with\nempty input?}
+        GUARD -->|Yes — extract SN\nfrom task| H
+        GUARD -->|No| H
+
+        SFIS_GUARD{SN task but\nsfis_query never called?}
+        SFIS_GUARD -->|Yes — force call| H
+        SFIS_GUARD -->|No| DONE[Exit loop]
+
+        subgraph TOOLS ["Tools  —  src/tools.py  ·  9 tools"]
             H --> H1{Which tool?}
 
             H1 -->|web_search| WS
@@ -72,13 +91,23 @@ flowchart TD
             end
 
             H1 -->|sfis_query| SF
-            subgraph SF_BOX ["SFIS  —  src/sfis.py"]
+            subgraph SF_BOX ["SFIS Traveler  —  src/sfis.py"]
                 SF[Login to\nhttp://10.52.1.9] --> SF1[Query traveler\nfor serial number]
-                SF1 --> SF2[Extract structured fields\nPHASE · MODEL · CONFIG\nLINE · PANEL SN\nFAILED DATE · GROUP NAME\nFAILURE MESSAGE\nLIST OF FAILING TESTS]
-                SF2 --> SF3{Component\nrequested?}
-                SF3 -->|Yes| SF4[Vendor query\nVENDOR · LOT NO\nDATE CODE]
-                SF3 -->|No| SF5[Return\nstructured result]
-                SF4 --> SF5
+                SF1 --> SF2[Extract structured summary\nPHASE · MODEL · CONFIG · LINE\nPANEL SN · FAILED DATE · GROUP NAME\nFAILURE MESSAGE · LIST OF FAILING TESTS\nLAB IN TIME]
+                SF2 --> SF3[Append full table dump\n── Full SFIS Tables ──\nall rows compact KEY=VALUE]
+                SF3 --> SF5[Return result\nauto-save to ChromaDB memory]
+            end
+
+            H1 -->|sfis_2a_defects| SF2A
+            subgraph SF2A_BOX ["SFIS 2A Defects"]
+                SF2A[Query defect records\nby date range] --> SF2A1{Records > 200?}
+                SF2A1 -->|Yes| SF2A2[Statistical summary\n+ Excel export]
+                SF2A1 -->|No| SF2A3[Inline records\nper SN]
+            end
+
+            H1 -->|sfis_pvs_query| SFPVS
+            subgraph SFPVS_BOX ["SFIS PVS Traceability"]
+                SFPVS[Query component vendor\nLOT NO · DATE CODE\nby SN + location]
             end
 
             H1 -->|memory_recall| MR
@@ -93,23 +122,38 @@ flowchart TD
             H1 -->|list_dir| FS
         end
 
-        WS1 & WS3 & WS4 --> OBS
-        SF5 --> OBS
-        MR & MS --> OBS
-        FU --> OBS
-        FS --> OBS
+        WS1 & WS3 & WS4 --> RAW
+        SF5 --> RAW
+        SF2A2 & SF2A3 --> RAW
+        SFPVS --> RAW
+        MR & MS --> RAW
+        FU --> RAW
+        FS --> RAW
 
-        OBS[Observation added\nto history] --> ITER{Max iterations\nhit?}
+        RAW[Raw tool result\nemitted to UI as tool_result SSE] --> RAG
+
+        subgraph RAG_BOX ["RAG Filter  —  src/rag.py"]
+            RAG[filter_observation\nresult > 2000 chars?]
+            RAG -->|No — pass through| OBS
+            RAG -->|Yes| RAG1[Query expansion\nLC→lot_no DC→date_code\nerror→list_of_failing_tests etc]
+            RAG1 --> RAG2[Chunk by format\nSFIS tables · web results\n2A records · generic]
+            RAG2 --> RAG3[Hybrid score\nBM25 + vector cosine\ncombined via RRF]
+            RAG3 --> RAG4[Relevance cutoff loop\ndrop chunks score < 0.30\nmax 1500 chars output]
+            RAG4 --> OBS
+        end
+
+        OBS[Filtered observation\nadded to LLM history] --> ITER{Max iterations\nhit?}
         ITER -->|No — loop back| D
         ITER -->|Yes| FALLBACK[Return fallback\nmessage]
     end
 
-    DONE --> SAV[Save Task+Answer\nto ChromaDB memory]
+    DONE --> SAV[Save Task+Answer\nto ChromaDB memory\nskip if SFIS tool was used]
     SAV --> STREAM
     FALLBACK --> STREAM
+    STOPPED --> STREAM
 
-    subgraph OUT ["Output"]
-        STREAM[SSE stream events\nto browser\nthought · tool_call\ntool_result · answer]
+    subgraph OUT ["Output  —  SSE events"]
+        STREAM[Stream events to browser\nthought · tool_call · tool_result\nanswer · stopped · error · done]
     end
 
     STREAM --> END([User sees response])
@@ -124,8 +168,9 @@ Each step in the loop emits an SSE event the browser renders in real time:
 | `start` | Loop begins | — |
 | `thought` | LLM produces a Thought | Italicised thought block |
 | `tool_call` | Tool about to run | Collapsible tool card with icon |
-| `tool_result` | Tool returned | Result inside the card |
+| `tool_result` | Tool returned | Result inside the card (full, unfiltered) |
 | `answer` | Final Answer produced | Markdown-rendered answer |
+| `stopped` | User pressed Stop button | "Generation stopped" notice |
 | `error` | Exception thrown | Error message |
 | `done` | Loop finished | — |
 

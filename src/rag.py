@@ -65,7 +65,9 @@ _EXPANSIONS: dict[str, str] = {
     "wifi":    "wifi wireless test",
     "dfu":     "device firmware update dfu",
     # Failure / quality terms
-    "fail":    "failed failure failing test_code error",
+    "fail":    "failed failure failing test_code error list_of_failing_tests failure_message",
+    "error":   "error failed failure test_code list_of_failing_tests failure_message",
+    "code":    "error_code test_code list_of_failing_tests failure_message",
     "pass":    "passed passing qa_result",
     "vendor":  "vendor manufacturer tsmc supply",
     "phase":   "phase version_code dvt evt mp",

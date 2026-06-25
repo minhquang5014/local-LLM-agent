@@ -26,6 +26,25 @@ When the user asks about a component vendor, lot number (LC for short), or date 
   - Call sfis_pvs_query with sn and location (e.g. sn=HMHHTX00E960000LQ7, location=U7000).
   - disable_period is applied automatically when sn is provided — do not add it manually.
 
+## SFIS field reference — user term → field name
+When the user asks for one of these, look for the corresponding SFIS field in the tool result:
+
+| User says | SFIS field to report |
+|---|---|
+| error code / error / failure code / fail code | LIST OF FAILING TESTS + FAILURE MESSAGE |
+| group / failure group | GROUP NAME |
+| fail date / when did it fail | FAILED DATE |
+| lab time / when checked in | LAB IN TIME |
+| phase / build phase | PHASE |
+| model / product | MODEL |
+| config / SW config | CONFIG |
+| line / SMT line | LINE |
+| panel SN / panel serial | PANEL SN |
+| lot number / LC | VENDOR LOT NO (from PVS query) |
+| date code / DC | DATE CODE (from PVS query) |
+
+Always include the full content of LIST OF FAILING TESTS when the user asks about errors or failures. Do NOT summarize or abbreviate the test names.
+
 ## Missing information
 If the user's request is unclear or missing required info (e.g. no SN provided), output a Final Answer asking the user for the specific information you need. Do NOT loop or call tools repeatedly.
 
