@@ -34,9 +34,9 @@ flowchart TD
 
     B --> C
 
-    subgraph SERVER ["Web Server  —  server.py  ·  GZip middleware"]
+    subgraph SERVER ["Web Server  —  server.py  ·  GZip (skips SSE)"]
         C[FastAPI receives request\nattaches session history\ncreates stop_event per session]
-        STOP_EP[/api/chat/stop\nsets stop_event for session]
+        STOP_EP["POST /api/chat/stop\nsets stop_event for session"]
     end
 
     STOP_BTN --> STOP_EP
@@ -45,7 +45,7 @@ flowchart TD
 
     subgraph AGENT ["ReAct Loop  —  src/agent.py  ·  max 10 iterations"]
         D[Build Prompt] --> D0
-        D0[Load system_prompt/*.md\nmain · sfis_workflow · response_format] --> D1
+        D0["Load system_prompt/*.md\nmain · sfis_workflow · response_format"] --> D1
         D1[Inject chat history\nlast 4 turns] --> D2
         D2[Auto memory recall\nChromaDB semantic search\ninjected as Relevant Memories] --> STOP_CHK
 
@@ -100,7 +100,7 @@ flowchart TD
 
             H1 -->|sfis_2a_defects| SF2A
             subgraph SF2A_BOX ["SFIS 2A Defects"]
-                SF2A[Query defect records\nby date range] --> SF2A1{Records > 200?}
+                SF2A[Query defect records\nby date range] --> SF2A1{"Records > 200?"}
                 SF2A1 -->|Yes| SF2A2[Statistical summary\n+ Excel export]
                 SF2A1 -->|No| SF2A3[Inline records\nper SN]
             end
@@ -133,12 +133,12 @@ flowchart TD
         RAW[Raw tool result\nemitted to UI as tool_result SSE] --> RAG
 
         subgraph RAG_BOX ["RAG Filter  —  src/rag.py"]
-            RAG[filter_observation\nresult > 2000 chars?]
+            RAG["filter_observation\nresult > 2000 chars?"]
             RAG -->|No — pass through| OBS
             RAG -->|Yes| RAG1[Query expansion\nLC→lot_no DC→date_code\nerror→list_of_failing_tests etc]
             RAG1 --> RAG2[Chunk by format\nSFIS tables · web results\n2A records · generic]
             RAG2 --> RAG3[Hybrid score\nBM25 + vector cosine\ncombined via RRF]
-            RAG3 --> RAG4[Relevance cutoff loop\ndrop chunks score < 0.30\nmax 1500 chars output]
+            RAG3 --> RAG4["Relevance cutoff loop\ndrop chunks score < 0.30\nmax 1500 chars output"]
             RAG4 --> OBS
         end
 
