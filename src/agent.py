@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from pathlib import Path
 from typing import TypedDict, List, Tuple, Optional, Annotated
 import operator
@@ -332,9 +333,21 @@ def stream_agent(task: str, chat_history: list | None = None, stop_event=None):
             "final_answer": None,
             "iterations": i,
         }
+        _t_prompt = time.time()
         prompt = _build_prompt(state, chat_history)
-        print(f"[AGENT iter={i}] Calling LLM ...")
+        print(f"[AGENT iter={i}] Prompt built in {time.time()-_t_prompt:.1f}s ({len(prompt)} chars) — calling LLM ...")
+        # Let the LLM backend see the stop flag so it can abort generation
+        # mid-stream (otherwise Stop only takes effect between iterations).
+        if stop_event is not None and hasattr(llm, "set_stop_event"):
+            llm.set_stop_event(stop_event)
+        _t_llm = time.time()
         raw = llm.invoke(prompt, stop=["\nObservation:"])
+        print(f"[AGENT iter={i}] LLM responded in {time.time()-_t_llm:.1f}s")
+        # Stop pressed during generation — bail out before acting on partial output.
+        if stop_event and stop_event.is_set():
+            print(f"[AGENT iter={i}] Stop requested during generation — aborting.")
+            yield {"type": "stopped", "content": "Generation stopped by user."}
+            return
         print(f"[AGENT iter={i}] Raw LLM output:\n{raw}\n---")
         thought, action, action_input, final_answer = _parse_llm_output(raw)
         print(f"[AGENT iter={i}] Parsed → thought={thought[:80]!r}  action={action!r}  input={action_input!r}  final_answer={'YES' if final_answer else 'NO'}")
@@ -387,7 +400,9 @@ def stream_agent(task: str, chat_history: list | None = None, stop_event=None):
             tool = tool_map.get(action)
             if tool:
                 try:
+                    _t_tool = time.time()
                     result = tool.run(action_input)
+                    print(f"[AGENT iter={i}] Tool {action!r} ran in {time.time()-_t_tool:.1f}s")
                 except Exception as e:
                     result = f"Tool error: {e}"
             else:
@@ -400,7 +415,10 @@ def stream_agent(task: str, chat_history: list | None = None, stop_event=None):
             # bridge — give them a larger budget so the LLM sees enough to answer.
             _web_tools = {"web_search", "fetch_url"}
             max_out = 6000 if action in _web_tools else 1500
+            _t_rag = time.time()
             filtered_result = filter_observation(task, result, tool_name=action, max_output=max_out)
+            print(f"[AGENT iter={i}] RAG filter ran in {time.time()-_t_rag:.1f}s "
+                  f"({len(result)}→{len(filtered_result)} chars)")
             history.append((thought, f"{action}|{action_input}", filtered_result))
         else:
             yield {"type": "answer", "content": "I couldn't determine the next step. Please try rephrasing."}

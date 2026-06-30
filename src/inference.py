@@ -63,6 +63,9 @@ class MlxLM(LLM):
     # These are set after load — excluded from pydantic schema
     _model: Any = None
     _tokenizer: Any = None
+    # Set per-request by the agent; checked between tokens so the Stop button
+    # can abort a generation mid-stream instead of waiting for it to finish.
+    _stop_event: Any = None
 
     class Config:
         arbitrary_types_allowed = True
@@ -73,6 +76,10 @@ class MlxLM(LLM):
             logger.info("Loading model with mlx-lm from %s …", self.model_path)
             self._model, self._tokenizer = load(self.model_path)
             logger.info("mlx-lm model loaded.")
+
+    def set_stop_event(self, event) -> None:
+        """Attach a threading.Event the agent can set to interrupt generation."""
+        self._stop_event = event
 
     @property
     def _llm_type(self) -> str:
@@ -85,30 +92,41 @@ class MlxLM(LLM):
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> str:
-        from mlx_lm import generate as mlx_generate
+        from mlx_lm import stream_generate
         self._load()
         from mlx_lm.sample_utils import make_sampler, make_repetition_penalty
         sampler = make_sampler(temp=self.temperature, top_p=self.top_p)
         logits_processors = [make_repetition_penalty(self.repetition_penalty)]
         formatted = _apply_qwen3_chat_template(prompt)
-        raw = mlx_generate(
+
+        # Stop sequences: cut as soon as one appears rather than generating to
+        # max_tokens (faster), and the same list trims the final text.
+        effective_stop = list(stop) if stop else []
+        effective_stop += ["\nObservation:", "\nHuman:", "\nUser:"]
+
+        stop_event = self._stop_event
+        text = ""
+        for resp in stream_generate(
             self._model,
             self._tokenizer,
             prompt=formatted,
             max_tokens=self.max_tokens,
             sampler=sampler,
             logits_processors=logits_processors,
-            verbose=False,
-        )
+        ):
+            text += resp.text
+            # User pressed Stop — abort generation immediately.
+            if stop_event is not None and stop_event.is_set():
+                break
+            # Early-exit once a stop sequence appears (the model has finished the
+            # useful part of this step — no need to keep generating).
+            if any(s in text for s in effective_stop):
+                break
+
         # Strip Qwen3 <think>...</think> blocks before any further processing.
-        raw = _strip_thinking(raw)
+        raw = _strip_thinking(text)
         # Fallback: also cut at the old "---" separator some versions used.
         raw = raw.split("\n---\n")[0].strip()
-        # Honour stop sequences — mlx-lm may not support them natively, so we
-        # post-process here.  This is the primary defence against the model
-        # hallucinating fake Observation: blocks.
-        effective_stop = list(stop) if stop else []
-        effective_stop += ["\nObservation:", "\nHuman:", "\nUser:"]
         for s in effective_stop:
             idx = raw.find(s)
             if idx != -1:
@@ -159,9 +177,14 @@ class HFChatLLM(LLM):
     repetition_penalty: float = 1.1
 
     _pipe: Any = None
+    _stop_event: Any = None
 
     class Config:
         arbitrary_types_allowed = True
+
+    def set_stop_event(self, event) -> None:
+        """Attach a threading.Event the agent can set to interrupt generation."""
+        self._stop_event = event
 
     @property
     def _llm_type(self) -> str:
@@ -175,6 +198,20 @@ class HFChatLLM(LLM):
         **kwargs: Any,
     ) -> str:
         formatted = _apply_qwen3_chat_template(prompt)
+
+        # Let the Stop button interrupt generation between tokens.
+        stopping_criteria = None
+        if self._stop_event is not None:
+            from transformers import StoppingCriteria, StoppingCriteriaList
+
+            event = self._stop_event
+
+            class _EventStop(StoppingCriteria):
+                def __call__(self, input_ids, scores, **kw):
+                    return event.is_set()
+
+            stopping_criteria = StoppingCriteriaList([_EventStop()])
+
         outputs = self._pipe(
             formatted,
             max_new_tokens=self.max_tokens,
@@ -183,6 +220,7 @@ class HFChatLLM(LLM):
             repetition_penalty=self.repetition_penalty,
             do_sample=True,
             return_full_text=False,
+            stopping_criteria=stopping_criteria,
         )
         raw = outputs[0]["generated_text"] if outputs else ""
         raw = _strip_thinking(raw)
