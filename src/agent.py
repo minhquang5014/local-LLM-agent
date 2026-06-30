@@ -396,7 +396,11 @@ def stream_agent(task: str, chat_history: list | None = None, stop_event=None):
             print(f"[AGENT iter={i}] Tool result ({len(result)} chars): {result[:200]}")
             yield {"type": "tool_result", "name": action, "output": result[:2000]}
             from src.rag import filter_observation
-            filtered_result = filter_observation(task, result, tool_name=action)
+            # Web tools return multi-source content already curated by the Mac #2
+            # bridge — give them a larger budget so the LLM sees enough to answer.
+            _web_tools = {"web_search", "fetch_url"}
+            max_out = 6000 if action in _web_tools else 1500
+            filtered_result = filter_observation(task, result, tool_name=action, max_output=max_out)
             history.append((thought, f"{action}|{action_input}", filtered_result))
         else:
             yield {"type": "answer", "content": "I couldn't determine the next step. Please try rephrasing."}

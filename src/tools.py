@@ -165,44 +165,79 @@ def _ddg_search(query: str, max_results: int) -> list[dict] | None:
 
 
 def _web_search(query: str) -> str:
-    from src.config import MAX_SEARCH_RESULTS
-    from datetime import date
+    """
+    Real-time web search via the Mac #2 bridge.
 
-    today = date.today().strftime("%B %d %Y")
-    dated_query = f"{query} {today}"
-
-    # 1. SearXNG — fully local, no rate limits (requires Docker or native install)
-    results = _searxng_search(dated_query, MAX_SEARCH_RESULTS)
-    if results is not None:
-        return _format_results(results, "SearXNG")
-
-    # 2. Brave Search — reliable API, free tier ~1000 req/month (set BRAVE_SEARCH_API_KEY)
-    results = _brave_search(dated_query, MAX_SEARCH_RESULTS)
-    if results is not None:
-        return _format_results(results, "Brave Search")
-
-    # 3. DuckDuckGo — free but can be rate-limited
-    results = _ddg_search(dated_query, MAX_SEARCH_RESULTS)
-    if results is not None:
-        return _format_results(results, "DuckDuckGo")
-
-    return (
-        "Web search unavailable. Options to fix:\n"
-        "  1. SearXNG: docker compose up -d  (or run natively)\n"
-        "  2. Brave Search: set BRAVE_SEARCH_API_KEY env var (free at api-dashboard.search.brave.com)\n"
-        "  3. DuckDuckGo: pip install ddgs  (may be rate-limited)"
+    The agent host (Mac #1, 10.52 network) has no internet, so the search is
+    delegated to the bridge_api service on Mac #2, which searches (SearXNG),
+    scrapes the top pages, trims/RAG-filters, and returns LLM-ready text.
+    """
+    import requests
+    from src.config import (
+        EXTERNAL_BRIDGE_URL, EXTERNAL_BRIDGE_API_KEY,
+        EXTERNAL_BRIDGE_TIMEOUT, MAX_SEARCH_RESULTS,
     )
+
+    if not EXTERNAL_BRIDGE_URL:
+        return "Web search unavailable: EXTERNAL_BRIDGE_URL is not configured (Mac #2 web bridge)."
+
+    try:
+        resp = requests.post(
+            f"{EXTERNAL_BRIDGE_URL}/search",
+            headers={
+                "X-API-Key": EXTERNAL_BRIDGE_API_KEY,
+                "Content-Type": "application/json",
+            },
+            json={
+                "query": query,
+                "num_results": MAX_SEARCH_RESULTS,
+                "rag": "auto",
+                "max_total_words": 2000,
+                "words_per_source": 350,
+            },
+            timeout=EXTERNAL_BRIDGE_TIMEOUT,
+        )
+    except requests.exceptions.ConnectionError:
+        return (
+            f"External web bridge offline — Mac #2 at {EXTERNAL_BRIDGE_URL} is unreachable. "
+            "Real-time web search is unavailable right now."
+        )
+    except requests.exceptions.Timeout:
+        return f"External web bridge timed out after {EXTERNAL_BRIDGE_TIMEOUT}s."
+    except Exception as e:
+        return f"Web search error via bridge: {e}"
+
+    if resp.status_code == 401:
+        return "Web bridge rejected the API key (401). Check EXTERNAL_BRIDGE_API_KEY matches the bridge."
+    if resp.status_code != 200:
+        return f"Web bridge returned HTTP {resp.status_code}: {resp.text[:200]}"
+
+    data = resp.json()
+    combined = (data.get("combined_text") or "").strip()
+    sources = data.get("sources", [])
+    if not combined:
+        return f"No web results found for '{query}'."
+
+    header = (
+        f"[Web search via Mac#2 · {data.get('backend', '?')} · "
+        f"{len(sources)} sources · mode={data.get('mode', '?')}]"
+    )
+    src_list = "\n".join(
+        f"  [{s.get('rank')}] {s.get('title') or s.get('domain')} — {s.get('url')}"
+        for s in sources
+    )
+    return f"{header}\n{src_list}\n\n{combined}"
 
 
 web_search_tool = Tool(
     name="web_search",
     func=_web_search,
     description=(
-        "Search the web. Auto-selects the best available backend: "
-        "SearXNG (local, no rate limits) → Brave Search API → DuckDuckGo. "
-        "Today's date is automatically appended so results are current. "
+        "Search the public web for current/real-time information (news, prices, "
+        "specs, anything outside the company network). Runs on the Mac #2 web "
+        "bridge: it searches, opens the top pages, and returns their content. "
         "Input: a search query string. "
-        "Output: titles, URLs, and snippets of the top results."
+        "Output: a list of sources followed by their extracted text."
     ),
 )
 
@@ -250,11 +285,84 @@ def _extract_text(html: str) -> str:
     return text
 
 
-def _fetch_url(url: str) -> str:
-    import requests
+def _is_internal_host(url: str) -> bool:
+    """
+    True if the URL points at the corporate/private network (10.52, localhost,
+    RFC-1918 ranges). Those must be fetched locally on Mac #1 — Mac #2 has no
+    route to them and must never be asked to reach the 10.52 network.
+    """
+    import ipaddress
+    from urllib.parse import urlparse
 
+    host = (urlparse(url).hostname or "").lower()
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".local"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        # A public domain name (not an IP) → fetch via the bridge.
+        return False
+
+
+def _fetch_url_via_bridge(url: str) -> str:
+    """Scrape a PUBLIC url through the Mac #2 bridge (which has internet)."""
+    import requests
+    from src.config import (
+        EXTERNAL_BRIDGE_URL, EXTERNAL_BRIDGE_API_KEY, EXTERNAL_BRIDGE_TIMEOUT,
+    )
+
+    if not EXTERNAL_BRIDGE_URL:
+        return "fetch_url unavailable for public URLs: EXTERNAL_BRIDGE_URL not configured (Mac #2)."
+
+    try:
+        resp = requests.post(
+            f"{EXTERNAL_BRIDGE_URL}/scrape",
+            headers={
+                "X-API-Key": EXTERNAL_BRIDGE_API_KEY,
+                "Content-Type": "application/json",
+            },
+            json={"url": url},
+            timeout=EXTERNAL_BRIDGE_TIMEOUT,
+        )
+    except requests.exceptions.ConnectionError:
+        return f"External web bridge offline — Mac #2 at {EXTERNAL_BRIDGE_URL} is unreachable."
+    except requests.exceptions.Timeout:
+        return f"External web bridge timed out after {EXTERNAL_BRIDGE_TIMEOUT}s."
+    except Exception as e:
+        return f"fetch_url error via bridge: {e}"
+
+    if resp.status_code == 401:
+        return "Web bridge rejected the API key (401). Check EXTERNAL_BRIDGE_API_KEY."
+    if resp.status_code != 200:
+        return f"Web bridge returned HTTP {resp.status_code}: {resp.text[:200]}"
+
+    data = resp.json()
+    if data.get("error") and not (data.get("text") or "").strip():
+        return f"Could not scrape {url}: {data['error']}"
+    text = (data.get("text") or "").strip()
+    if not text:
+        return f"Page fetched but no readable text found at {url} (may require JavaScript)."
+    title = data.get("title") or data.get("domain") or url
+    trunc = " (truncated)" if data.get("truncated") else ""
+    return f"[Scraped via Mac#2: {title} — {url}{trunc}]\n\n{text}"
+
+
+def _fetch_url(url: str) -> str:
     if not url.startswith(("http://", "https://")):
         url = "http://" + url
+
+    # Public URLs go through the Mac #2 bridge; internal/private URLs stay local.
+    if not _is_internal_host(url):
+        return _fetch_url_via_bridge(url)
+
+    return _fetch_url_local(url)
+
+
+def _fetch_url_local(url: str) -> str:
+    import requests
 
     headers = {
         "User-Agent": (
@@ -294,9 +402,9 @@ fetch_url_tool = Tool(
     name="fetch_url",
     func=_fetch_url,
     description=(
-        "Scrape and extract text from any URL — works for public websites AND "
-        "internal network addresses (e.g. http://10.52.1.9). "
-        "Automatically strips menus/ads and focuses on main content. "
+        "Scrape and extract readable text from a URL. Public websites are fetched "
+        "through the Mac #2 web bridge; internal addresses (e.g. http://10.52.1.9) "
+        "are fetched locally. Strips menus/ads and focuses on main content. "
         "Input: a URL or bare IP address (scheme optional). "
         "Output: clean extracted text ready for summarisation."
     ),
