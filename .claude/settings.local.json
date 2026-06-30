@@ -8,7 +8,10 @@
       "WebFetch(domain:docs.searxng.org)",
       "WebSearch",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:docs.langchain.com)"
+      "WebFetch(domain:docs.langchain.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(git -C \"c:\\\\Users\\\\tommy_trann\\\\local-LLM-agent\" log --oneline -1)",
+      "Bash(python -c ' *)"
     ]
   }
 }
