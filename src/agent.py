@@ -27,6 +27,22 @@ import operator
 # Matches serial-number-like tokens: 8+ uppercase alphanumeric chars
 _SN_RE = re.compile(r'\b([A-Z0-9]{8,})\b')
 
+# SFIS tool names — their results are exact-keyword data (SN, U7000, LC/DC, error
+# codes), so RAG filters them with BM25-only (no embedding) for speed + precision.
+_SFIS_TOOLS = {"sfis_query", "sfis_2a_defects", "sfis_pvs_query"}
+
+
+def _looks_like_sfis(task: str) -> bool:
+    """True if the task is an SFIS/serial-number lookup (live data — skip memory)."""
+    task_up = task.upper()
+    return (
+        bool(_SN_RE.search(task))
+        or "SERIAL" in task_up
+        or " SN " in task_up
+        or "SFIS" in task_up
+        or task_up.startswith("SN")
+    )
+
 from langgraph.graph import StateGraph, END
 
 from src.config import MAX_ITERATIONS
@@ -81,8 +97,10 @@ SYSTEM_PROMPT = _load_system_prompt().format(TOOL_DESCRIPTIONS=TOOL_DESCRIPTIONS
 def _build_prompt(state: AgentState, chat_history: list | None = None) -> str:
     lines = [SYSTEM_PROMPT]
 
-    # Auto memory recall on the first step — inject relevant past context
-    if not state["history"]:
+    # Auto memory recall on the first step — inject relevant past context.
+    # Skipped for SFIS tasks: they must be fetched live, and skipping avoids
+    # loading/using the embedding model on the SFIS path entirely (faster).
+    if not state["history"] and not _looks_like_sfis(state["task"]):
         try:
             from src.memory import MemoryStore
             memories = MemoryStore().search_text(state["task"], k=3)
@@ -292,15 +310,7 @@ def _sfis_guard(task: str, final_answer: Optional[str], history: list, tool_map:
     already_called = any("sfis_query" in act for _, act, _ in history)
     if already_called:
         return None, None
-    task_up = task.upper()
-    is_sfis = (
-        bool(_SN_RE.search(task))
-        or "SERIAL" in task_up
-        or " SN " in task_up
-        or "SFIS" in task_up
-        or task_up.startswith("SN")
-    )
-    if not is_sfis:
+    if not _looks_like_sfis(task):
         return None, None
     m = _SN_RE.search(task)
     sn = m.group(1) if m else ""
@@ -416,7 +426,11 @@ def stream_agent(task: str, chat_history: list | None = None, stop_event=None):
             _web_tools = {"web_search", "fetch_url"}
             max_out = 6000 if action in _web_tools else 1500
             _t_rag = time.time()
-            filtered_result = filter_observation(task, result, tool_name=action, max_output=max_out)
+            # SFIS results are exact-keyword → BM25-only (skip embedding) for speed.
+            filtered_result = filter_observation(
+                task, result, tool_name=action, max_output=max_out,
+                bm25_only=(action in _SFIS_TOOLS),
+            )
             print(f"[AGENT iter={i}] RAG filter ran in {time.time()-_t_rag:.1f}s "
                   f"({len(result)}→{len(filtered_result)} chars)")
             history.append((thought, f"{action}|{action_input}", filtered_result))

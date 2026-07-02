@@ -301,17 +301,22 @@ def _rrf_combine(scores_list: list[list[float]], k: int = _RRF_K) -> list[float]
 
 # ── 6. Hybrid scoring entry point ──────────────────────────────────
 
-def _hybrid_score(question: str, chunks: list[str]) -> list[tuple[float, str]]:
+def _hybrid_score(question: str, chunks: list[str],
+                  bm25_only: bool = False) -> list[tuple[float, str]]:
     """
     Score each chunk using BM25 + vector cosine similarity combined via RRF.
     Falls back to BM25-only if vector scoring is unavailable.
+
+    bm25_only=True skips the embedding step entirely — used for SFIS results,
+    which are exact-keyword (serial numbers, U7000, LC/DC, error codes) where
+    BM25 is both faster and more precise than semantic similarity.
     Returns [(hybrid_score, chunk), ...] sorted descending.
     """
     expanded = _expand_query(question)
     query_tokens = _tokenise(expanded)
 
     bm25 = _bm25_scores(query_tokens, chunks)
-    vector = _vector_scores(expanded, chunks)
+    vector = None if bm25_only else _vector_scores(expanded, chunks)
 
     if vector is not None:
         combined = _rrf_combine([bm25, vector])
@@ -337,6 +342,7 @@ def filter_observation(
     threshold: int = _FILTER_THRESHOLD,
     max_output: int = _MAX_OUTPUT,
     relevance_cutoff: float = _RELEVANCE_CUTOFF,
+    bm25_only: bool = False,
 ) -> str:
     """
     Return only the chunks of `text` most relevant to `question`.
@@ -370,7 +376,7 @@ def filter_observation(
     print(f"[RAG] {tool_name or 'tool'}: {len(text)} chars → {len(chunks)} chunks | "
           f"cutoff={relevance_cutoff} | q: {question[:60]!r}")
 
-    scored = _hybrid_score(question, chunks)
+    scored = _hybrid_score(question, chunks, bm25_only=bm25_only)
 
     # First chunk = structured summary / header — always include
     first = chunks[0]
