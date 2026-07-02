@@ -2,6 +2,13 @@
 
 Local ReAct agent running the Qwen3-9B model (safetensors format). Capabilities: web search, persistent vector memory, SFIS manufacturing database query, file tools, and web scraping.
 
+Reference from some of the Github source code:
+github.com/agentscope-ai/QwenPaw
+github.com/openclaw/openclaw
+github.com/crewAIInc/crewAI
+github.com/microsoft/autogen
+llama-index + langgraph combo
+
 **Primary runtime:** Mac Mini M4 24GB — uses mlx-lm for fast native inference (~40 tok/s).
 **Secondary:** Asus Laptop with NVIDIA GPU — falls back to HuggingFace transformers (CUDA).
 
@@ -47,7 +54,7 @@ flowchart TD
         D[Build Prompt] --> D0
         D0["Load system_prompt/*.md\nmain · sfis_workflow · response_format"] --> D1
         D1[Inject chat history\nlast 4 turns] --> D2
-        D2[Auto memory recall\nChromaDB semantic search\ninjected as Relevant Memories] --> STOP_CHK
+        D2["Auto memory recall\nChromaDB semantic search\n(skipped for SFIS tasks)"] --> STOP_CHK
 
         STOP_CHK{stop_event\nset?}
         STOP_CHK -->|Yes| STOPPED[Emit stopped event\nabort loop]
@@ -82,12 +89,9 @@ flowchart TD
             H --> H1{Which tool?}
 
             H1 -->|web_search| WS
-            subgraph WS_BOX ["Web Search  —  auto-fallback chain"]
-                WS{SearXNG\nrunning?}
-                WS -->|Yes| WS1[SearXNG\nlocalhost:8080\nno rate limits]
-                WS -->|No| WS2{BRAVE_SEARCH\n_API_KEY set?}
-                WS2 -->|Yes| WS3[Brave Search API\n~1000 req/mo free]
-                WS2 -->|No| WS4[DuckDuckGo\nddgs · may rate-limit]
+            subgraph WS_BOX ["Web Search  —  via Mac #2 bridge (internet)"]
+                WS["POST /search to\nEXTERNAL_BRIDGE_URL\nX-API-Key header"] --> WS1[Mac #2: SearXNG →\nscrape top pages →\nadaptive RAG trim]
+                WS1 --> WS2[Return combined_text\n+ source list]
             end
 
             H1 -->|sfis_query| SF
@@ -117,17 +121,19 @@ flowchart TD
             end
 
             H1 -->|memory_store| MS
-            H1 -->|fetch_url| FU[HTTP GET\nBeautifulSoup extraction\nchunked for large pages]
+            H1 -->|fetch_url| FU{Internal\n10.52 / private IP?}
+            FU -->|Yes| FU1[Fetch locally on Mac #1\nBeautifulSoup extract]
+            FU -->|No — public URL| FU2[POST /scrape to Mac #2\ncleaned text]
             H1 -->|read_file| FS[Read local file\nmax 1 MB]
             H1 -->|list_dir| FS
         end
 
-        WS1 & WS3 & WS4 --> RAW
+        WS2 --> RAW
         SF5 --> RAW
         SF2A2 & SF2A3 --> RAW
         SFPVS --> RAW
         MR & MS --> RAW
-        FU --> RAW
+        FU1 & FU2 --> RAW
         FS --> RAW
 
         RAW[Raw tool result\nemitted to UI as tool_result SSE] --> RAG
@@ -137,7 +143,7 @@ flowchart TD
             RAG -->|No — pass through| OBS
             RAG -->|Yes| RAG1[Query expansion\nLC→lot_no DC→date_code\nerror→list_of_failing_tests etc]
             RAG1 --> RAG2[Chunk by format\nSFIS tables · web results\n2A records · generic]
-            RAG2 --> RAG3[Hybrid score\nBM25 + vector cosine\ncombined via RRF]
+            RAG2 --> RAG3["Hybrid score\nBM25 + vector via RRF\n(SFIS: BM25-only, no embedding)"]
             RAG3 --> RAG4["Relevance cutoff loop\ndrop chunks score < 0.30\nmax 1500 chars output"]
             RAG4 --> OBS
         end
@@ -219,9 +225,52 @@ Output is now a clean, ordered list of fields instead of a raw table dump.
 
 ---
 
+## Changes Made (2026-07-02)
+
+### Dual-Mac web bridge — web_search / fetch_url now go through Mac #2
+The agent host (Mac #1) is air-gapped on `10.52` with no internet, so real-time web
+access is delegated to a bridge on Mac #2 (own repo: **Web-searching-agent**).
+- `src/tools.py`: `web_search` POSTs to the bridge `POST /search` (SearXNG → scrape →
+  adaptive-RAG trim → `combined_text`). `fetch_url` **splits by host** — public URLs →
+  bridge `POST /scrape`; internal/private (`10.52`, localhost, RFC-1918) → fetched
+  locally so SFIS scraping still works. Both send an `X-API-Key` header.
+- `src/config.py`: `EXTERNAL_BRIDGE_URL`, `EXTERNAL_BRIDGE_API_KEY`,
+  `EXTERNAL_BRIDGE_TIMEOUT`. Legacy SearXNG/Brave/DDG kept only for internet-connected
+  dev machines.
+- See [README.md](README.md) for the full dual-Mac + Thunderbolt networking setup.
+
+### Inference latency — reduce "thinking" time on the M4
+- `src/inference.py`: `MlxLM` now streams tokens (`stream_generate`), checks a
+  per-request stop event after each token (**Stop button interrupts mid-generation**),
+  and **early-exits as soon as a stop sequence appears** instead of running to
+  max_tokens — faster per step.
+- `system_prompt/response_format.md`: every Thought must be ONE short sentence, detail
+  goes in the Final Answer — fewer generated tokens per step.
+- `src/rag.py` + `src/agent.py`: `filter_observation(..., bm25_only=True)` for SFIS
+  tool results, and auto memory-recall is skipped for SFIS tasks. Net effect: the
+  **SFIS path never loads or runs the embedding model** (no cold-load, no per-query
+  embedding).
+- `src/agent.py`: per-phase timing logs (prompt / LLM / tool / RAG) to diagnose slow
+  turns; SN auto-substitute guard when `sfis_query` is called with empty input.
+
+### UI — offline rendering + collapsible reasoning
+- `static/index.html`: `marked.js` is **vendored locally** (`static/marked.min.js`,
+  served via a `StaticFiles` mount) instead of a CDN — the final answer now renders on
+  the air-gapped LAN (the CDN failing silently was why answers didn't show). Reasoning
+  blocks are collapsible and auto-collapse when the answer arrives; light-mode bubble
+  text fixed.
+- `server.py`: `SelectiveGZipMiddleware` gzips HTML/JS/JSON but **skips the SSE stream**
+  (gzipping a stream broke real-time delivery).
+
+---
+
 ## Web Search Engine Options
 
-Current tool uses DuckDuckGo (ddgs), which can be rate-limited and blocked. Fully local alternatives to consider:
+> **Note:** web search now runs on **Mac #2** (the bridge), not on the agent host.
+> Mac #1's `web_search` tool just calls `POST /search` on the bridge. The backend
+> options below all live on Mac #2; **SearXNG** was chosen. See [README.md](README.md).
+
+The engine options considered (all run on Mac #2):
 
 | Option | Type | Pros | Cons | Best For |
 |--------|------|------|------|----------|
@@ -234,15 +283,17 @@ Current tool uses DuckDuckGo (ddgs), which can be rate-limited and blocked. Full
 
 ---
 
-## Web Search Backends
+## Web Search Backends (run inside the Mac #2 bridge)
 
-The agent auto-detects the best available search backend. Priority order:
+The bridge's `search.py` auto-detects the best available backend. Priority order:
 
 ```
 SearXNG (local) → Brave Search API → DuckDuckGo
 ```
 
-Each result block is labelled with the source used (e.g. `[Search via Brave Search]`).
+This chain runs on **Mac #2**, not on the agent host. Mac #1 never talks to these
+engines directly — it only calls the bridge `POST /search`, which returns scraped,
+trimmed `combined_text`. The setup steps below are performed **on Mac #2**.
 
 ---
 
@@ -330,8 +381,35 @@ Requires `pip install ddgs`. Works out of the box but can be rate-limited under 
 
 ---
 
+## Roadmap — Better RAG + SIP Logs + CSV (research)
+
+Full research + design in [note/research-rag-logs-csv.md](note/research-rag-logs-csv.md).
+Sources studied (added to the top of this file): QwenPaw (layered memory), openclaw
+(skills-as-config), crewAI / autogen (multi-agent — deferred), and **llama-index +
+langgraph** (the core RAG reference). Offline constraint on Mac #1 → prefer techniques
+needing **no new model download / no GPU**.
+
+| Phase | Change | Files | Risk |
+|---|---|---|---|
+| **A** | RAG **parent–child retrieval** (match small chunk, return parent block + header) + format-aware chunk sizing | `rag.py` | low |
+| **B** | `read_csv` tool — schema + stats + safe aggregates (no code-exec) | `tools.py` | low |
+| C | `analyze_log` tool — block chunk + severity filter + BM25 for SIP logs | `tools.py`, `rag.py` | med |
+| D | **Drain3** log template mining (pure-Python, offline; pip-install while online) | new dep | med |
+| E | MMR de-duplication for web content (skip for SFIS — no embeddings there) | `rag.py` | low |
+| F | Layered memory (QwenPaw-style: verbatim recent → distilled older) | `memory.py` | med |
+| G | Multi-agent split (crewAI / autogen style) | larger refactor | high |
+
+**Start with Phase A** — helps SFIS, logs, and CSV at once, low risk, no new deps.
+
+---
+
 ## Known Issues / TODO
 
-- Memory embedding uses ChromaDB's default model (all-MiniLM-L6-v2), downloaded on first run
+- SFIS path is embedding-free (BM25-only); the embedding model (all-MiniLM-L6-v2) is
+  still used for memory recall + web/general RAG, downloaded on first run
 - Session history is in-memory only — lost on server restart
 - No token budget management — very long prompts may overflow Qwen context window
+- First inference after a server restart is slow (mlx cold-loads the 9B model + Metal
+  kernel compile) — a one-time cost per start
+- Mac #2 bridge must be kept awake (`caffeinate -s`) or real-time search intermittently
+  fails to reach `192.168.100.2`
